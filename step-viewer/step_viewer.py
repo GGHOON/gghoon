@@ -208,6 +208,30 @@ def exact_bbox(shape):
     return (*lo, *hi)
 
 
+def _unique_edges(shape):
+    """형상의 모서리를 중복 없이(면 2개가 공유하는 모서리도 한 번만) 돌려준다."""
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopoDS import TopoDS
+    try:
+        from OCP.TopExp import TopExp
+        from OCP.TopTools import TopTools_IndexedMapOfShape
+        emap = TopTools_IndexedMapOfShape()
+        TopExp.MapShapes_s(shape, TopAbs_EDGE, emap)
+        return [TopoDS.Edge_s(emap.FindKey(i)) for i in range(1, emap.Extent() + 1)]
+    except ImportError:  # 라이브러리 버전에 따라 이름이 다를 때
+        from OCP.TopExp import TopExp_Explorer
+        seen, out = set(), []
+        ex = TopExp_Explorer(shape, TopAbs_EDGE)
+        while ex.More():
+            e = TopoDS.Edge_s(ex.Current())
+            h = hash(e)
+            if h not in seen:
+                seen.add(h)
+                out.append(e)
+            ex.Next()
+        return out
+
+
 def _volume(shape) -> float:
     from OCP.BRepGProp import BRepGProp
     from OCP.GProp import GProp_GProps
@@ -221,10 +245,6 @@ def analyze_text(text: str, name: str, default_density: float | None = None, ful
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
     from OCP.GeomAbs import GeomAbs_Circle
-    from OCP.TopAbs import TopAbs_EDGE
-    from OCP.TopExp import TopExp
-    from OCP.TopoDS import TopoDS
-    from OCP.TopTools import TopTools_IndexedMapOfShape
 
     t0 = _t.perf_counter()
     shape = load_shape_from_text(text, full_fix)
@@ -253,10 +273,7 @@ def analyze_text(text: str, name: str, default_density: float | None = None, ful
 
     # 원형 모서리의 지름 목록: 구멍, 외경, 필렛 경계 등을 한눈에 보기 위함 (같은 모서리는 한 번만)
     diams = Counter()
-    emap = TopTools_IndexedMapOfShape()
-    TopExp.MapShapes_s(shape, TopAbs_EDGE, emap)
-    for i in range(1, emap.Extent() + 1):
-        e = TopoDS.Edge_s(emap.FindKey(i))
+    for e in _unique_edges(shape):
         try:
             if BRep_Tool.Degenerated_s(e):
                 continue
