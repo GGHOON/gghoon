@@ -1,0 +1,28 @@
+# STEP 뷰어
+
+STEP(.stp/.step) 파일을 3D로 보고 외형 치수·부피·질량·면 구성·원형 모서리 지름을 보여 주는 윈도우용 로컬 프로그램입니다.
+
+## 파이썬 없이 쓰기 (권장)
+
+1. 이 저장소의 **Releases → `stepviewer-latest`** 에서 `STEPViewer-win64.zip` 을 받습니다.
+2. 원하는 로컬 폴더(예: `C:\STEPViewer`)에 압축을 풉니다. USB나 네트워크 드라이브에서 바로 실행하지 마세요.
+3. `STEPViewer.exe` 를 실행하면 메인 창이 뜹니다.
+4. STEP 파일 더블클릭으로 열려면 `파일연결_등록.bat` 을 한 번 실행합니다. (해제: `파일연결_해제.bat`)
+
+배포판은 `step-viewer` 폴더가 바뀔 때마다 GitHub Actions(윈도우 서버)에서 자동으로 만들어지고, 자체 점검을 통과해야 올라갑니다.
+
+## 파이썬으로 실행하기
+
+- `step_viewer_설치.bat` : 파이썬과 라이브러리(cadquery-ocp, pyvista)를 설치합니다.
+- `step_viewer_run.bat` : 실행
+- `step_viewer_파일연결_등록.bat` / `_해제.bat` : 더블클릭 연결
+- `step_viewer_exe만들기.bat` : 이 PC에서 직접 exe 묶음 만들기 (`prune_vtk.py` 필요)
+
+## 3D 창 단축키
+
+왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동 · Space/A 자동 회전 · ↑↓ 회전 속도 · V 정면 · T 상면 · I 등각 · W 와이어프레임 · S 솔리드 · B 외곽 상자 · Q 닫기
+
+## 참고
+
+- 한 번 연 모델은 실행 폴더의 `step_history` 에 저장되어 다음부터 즉시 열립니다. 이 폴더에는 열어 본 STEP 사본이 들어 있으니 다른 곳으로 옮기거나 공유하지 마세요.
+- 형상이 깨져 보이면 메인 창의 "정밀 보정" 을 켜고 다시 엽니다.

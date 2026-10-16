@@ -1,0 +1,123 @@
+# STEP 뷰어 윈도우 배포판(exe) 자동 빌드
+# step-viewer 폴더가 바뀌면 GitHub 의 윈도우 서버에서 exe 묶음을 만들고, 자체 점검 후
+# Releases 의 "stepviewer-latest" 에 STEPViewer-win64.zip 으로 올린다. (파이썬 없이 실행 가능)
+name: Build STEPViewer (Windows)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "step-viewer/**"
+      - ".github/workflows/stepviewer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: step-viewer
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install libraries
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cadquery-ocp pyvista pyinstaller
+
+      - name: Self test (source, no render)
+        run: |
+          python step_viewer.py --selftest --no-render
+          $code = $LASTEXITCODE
+          Get-Content step_selftest.log | ForEach-Object { if ($code -ne 0) { "::error::$_" } else { $_ } }
+          exit $code
+
+      - name: Build exe (PyInstaller)
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name STEPViewer `
+            --hidden-import vtkmodules.vtkRenderingOpenGL2 --hidden-import vtkmodules.vtkInteractionStyle `
+            --hidden-import vtkmodules.vtkRenderingFreeType --hidden-import vtkmodules.vtkRenderingAnnotation `
+            --hidden-import vtkmodules.vtkIOXML --hidden-import vtkmodules.vtkIOGeometry `
+            --hidden-import vtkmodules.vtkFiltersCore --hidden-import vtkmodules.vtkFiltersGeneral `
+            --hidden-import vtkmodules.vtkFiltersSources --hidden-import vtkmodules.vtkRenderingUI `
+            --exclude-module cadquery --exclude-module casadi --exclude-module nlopt --exclude-module ezdxf `
+            --exclude-module IPython --exclude-module trame --exclude-module PyQt5 --exclude-module PySide6 `
+            --exclude-module numba --exclude-module llvmlite --exclude-module cv2 --exclude-module imageio_ffmpeg `
+            --exclude-module imageio --exclude-module pandas --exclude-module scipy --exclude-module sklearn `
+            step_viewer.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "size before prune: {0:N0} MB" -f ((Get-ChildItem dist/STEPViewer -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Prune unused VTK files
+        run: python prune_vtk.py dist/STEPViewer
+
+      - name: Self test (exe, no render)
+        run: |
+          function Run-Test {
+            $p = Start-Process -FilePath dist/STEPViewer/STEPViewer.exe -ArgumentList "--selftest","--no-render" -Wait -PassThru
+            Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { "  $_" }
+            return $p.ExitCode
+          }
+          $code = Run-Test
+          if ($code -ne 0) {
+            "::warning::pruned build failed self test - restoring removed VTK files"
+            Move-Item dist/STEPViewer/_vtk_removed/* dist/STEPViewer/_internal/vtkmodules/ -Force
+            $code = Run-Test
+            if ($code -ne 0) {
+              Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { "::error::$_" }
+              exit 1
+            }
+          }
+          if (Test-Path dist/STEPViewer/_vtk_removed) { Remove-Item dist/STEPViewer/_vtk_removed -Recurse -Force }
+          "size after prune: {0:N0} MB" -f ((Get-ChildItem dist/STEPViewer -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Self test (exe, real 3D window via software OpenGL)
+        id: rendertest
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 빌드 서버에는 그래픽 카드가 없어서, 시험용으로만 Mesa(소프트웨어 OpenGL)를 복사본 폴더에 넣고 점검
+          gh release download -R pal1000/mesa-dist-win --pattern "mesa3d-*-release-msvc.7z" -D $env:RUNNER_TEMP
+          $sz = Get-ChildItem $env:RUNNER_TEMP -Filter "mesa3d-*-release-msvc.7z" | Select-Object -First 1
+          7z x $sz.FullName "-o$env:RUNNER_TEMP\mesa" -y | Out-Null
+          Copy-Item dist/STEPViewer "$env:RUNNER_TEMP\apptest" -Recurse
+          Copy-Item "$env:RUNNER_TEMP\mesa\x64\*.dll" "$env:RUNNER_TEMP\apptest\"
+          Copy-Item "$env:RUNNER_TEMP\mesa\x64\*.dll" "$env:RUNNER_TEMP\apptest\_internal\vtkmodules\"
+          $env:GALLIUM_DRIVER = "llvmpipe"
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP\apptest\STEPViewer.exe" -ArgumentList "--selftest" -Wait -PassThru
+          $log = Get-Content "$env:RUNNER_TEMP\apptest\step_selftest.log"
+          $log | ForEach-Object { "  $_" }
+          if ($p.ExitCode -ne 0) { $log | ForEach-Object { "::warning::render test: $_" }; exit 1 }
+          "::notice::render self test OK"
+
+      - name: Package
+        run: |
+          Remove-Item dist/STEPViewer/step_selftest.log -ErrorAction SilentlyContinue
+          Copy-Item "exe_파일연결_등록.bat" "dist/STEPViewer/파일연결_등록.bat"
+          Copy-Item "exe_파일연결_해제.bat" "dist/STEPViewer/파일연결_해제.bat"
+          Compress-Archive -Path dist/STEPViewer -DestinationPath STEPViewer-win64.zip -CompressionLevel Optimal
+          "zip: {0:N0} MB" -f ((Get-Item STEPViewer-win64.zip).Length / 1MB)
+
+      - name: Publish release (stepviewer-latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete stepviewer-latest -y --cleanup-tag 2>$null
+          $render = "${{ steps.rendertest.outcome }}"
+          $notes = "STEP 뷰어 윈도우 배포판 (파이썬 설치 불필요)`n`n" +
+                   "1. STEPViewer-win64.zip 을 받아 원하는 로컬 폴더에 압축을 풉니다.`n" +
+                   "2. STEPViewer 폴더의 STEPViewer.exe 를 실행합니다.`n" +
+                   "3. STEP 더블클릭으로 열려면 파일연결_등록.bat 을 한 번 실행합니다.`n`n" +
+                   "빌드 커밋: $env:GITHUB_SHA / 3D 창 자체 점검: $render"
+          gh release create stepviewer-latest STEPViewer-win64.zip --title "STEPViewer (Windows)" --notes $notes --target $env:GITHUB_SHA

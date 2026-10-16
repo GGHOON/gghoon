@@ -1,0 +1,6 @@
+step-viewer/build/
+step-viewer/dist/
+step-viewer/*.spec
+step-viewer/step_history/
+step-viewer/*.log
+__pycache__/

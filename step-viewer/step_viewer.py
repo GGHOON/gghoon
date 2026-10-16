@@ -1,0 +1,1732 @@
+#!/usr/bin/env python3
+"""STEP 뷰어 + 자동 정보 추출 (로컬 프로그램)
+
+기본 사용법
+  1) python step_viewer.py 실행 (또는 step_viewer_run.bat 더블클릭)
+  2) [파일 선택 → 자동 모델링] 버튼을 누르고 STEP 파일을 고른다
+  3) 메모장이 잠깐 열렸다 닫히며 내용을 읽고, 3D 창과 치수·부피·질량이 나온다
+     (진행 중에는 키보드와 마우스를 건드리지 말 것. 3D 창을 닫으면 다음 파일을 고를 수 있다)
+
+복잡한 형상도 창이 멈추지 않도록 계산은 별도 프로세스에서 하고, 한 번 연 모델은
+  step_history 폴더에 결과(메시·치수)를 저장해 두어 다음부터 즉시 열린다.
+
+STEP 파일 더블클릭으로 열기(한 번만 등록)
+  step_viewer_파일연결_등록.bat 실행 (해제: step_viewer_파일연결_해제.bat)
+
+그 밖의 사용법
+  python step_viewer.py --clip                터미널에서 복사 후 Enter 방식
+  python step_viewer.py 부품.stp              파일을 직접 열기
+  python step_viewer.py --open                파일 선택 창으로 열기
+  python step_viewer.py --info                창 없이 정보만 출력
+  python step_viewer.py --png a.png           창 없이 이미지로 저장
+  python step_viewer.py 폴더 --csv out.csv    폴더 안 모든 STEP을 표로 정리
+
+설치(한 번만)
+  pip install cadquery-ocp pyvista   (기존 cadquery 가 설치돼 있으면 그대로 사용 가능)
+
+3D 창 조작: 왼쪽 드래그=회전, 휠=확대, Shift+드래그(또는 가운데 버튼)=이동
+            Space/A: 자동 회전 켜기·끄기 / ↑↓: 회전 속도 / v: 정면 / t: 상면 / i: 등각
+            w: 와이어프레임 / s: 솔리드 / b: 바깥 사각 틀 켜기·끄기(기본 꺼짐) / q: 종료 (창 아래쪽에 단축키 안내가 표시됨)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+# exe 로 묶어 배포한 경우(PyInstaller)에는 exe 가 있는 폴더, 아니면 이 .py 가 있는 폴더
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+
+
+def self_command() -> list:
+    """자기 자신을 다시 실행하는 명령 (exe 이면 exe 만, .py 이면 python + 스크립트)."""
+    return [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+
+
+STEP_EXTS = {".stp", ".step"}
+
+
+def preload_occ():
+    """CAD 엔진(OpenCascade) 모듈을 미리 불러 둔다. (cadquery 없이 직접 사용 → 시작이 빠르고 배포 용량이 작다)"""
+    import OCP.BRepMesh  # noqa: F401
+    import OCP.STEPControl  # noqa: F401
+
+
+# ---------------------------------------------------------------- STEP 텍스트에서 읽는 부가 정보
+def decode_step_string(s: str) -> str:
+    """STEP의 \\X2\\C194...\\X0\\ (UTF-16 16진수) 한글 표기를 일반 문자열로 바꿉니다."""
+    def repl(m):
+        hexs = m.group(1)
+        try:
+            return "".join(chr(int(hexs[i:i + 4], 16)) for i in range(0, len(hexs), 4))
+        except ValueError:
+            return m.group(0)
+    return re.sub(r"\\X2\\([0-9A-Fa-f]+)\\X0\\", repl, s)
+
+
+def read_step_meta(text: str) -> dict:
+    """STEP 텍스트에 적힌 품명, 재질, 밀도, 작성 프로그램을 읽습니다. 없으면 빈 값."""
+    meta = {"part": "", "material": "", "density": None, "software": "", "color": None}
+    m = re.search(
+        r"COLOUR_RGB\(\s*'[^']*'\s*,\s*([0-9.eE+-]+)\s*,\s*([0-9.eE+-]+)\s*,\s*([0-9.eE+-]+)\s*\)", text
+    )
+    if m:  # 파일에 적힌 표면 색상 (0~1 비율)
+        r, g, b = (max(0, min(255, round(float(v) * 255))) for v in m.groups())
+        meta["color"] = f"#{r:02x}{g:02x}{b:02x}"
+    m = re.search(r"#\d+=PRODUCT\('([^']*)'\s*,\s*'([^']*)'", text)
+    if m:
+        meta["part"] = decode_step_string(m.group(1))
+    m = re.search(r"DESCRIPTIVE_REPRESENTATION_ITEM\('([^']*)'", text)
+    if m:
+        meta["material"] = decode_step_string(m.group(1))
+    m = re.search(r"'density measure'\s*,\s*POSITIVE_RATIO_MEASURE\(\s*([0-9.eE+-]+)\s*\)", text)
+    if m:
+        meta["density"] = float(m.group(1))  # 단위: g/cm^3 (Inventor 출력 기준)
+    m = re.search(r"originating_system \*/\s*'([^']*)'", text)
+    if m:
+        meta["software"] = m.group(1)
+    return meta
+
+
+# ---------------------------------------------------------------- 형상 읽기와 분석
+# STEP 을 읽을 때 OpenCascade 는 형상 보정(ShapeFix)을 하는데, 그중 '자기교차/와이어 교차 검사'가
+# 변환 시간의 60~70%를 차지한다(프로파일 결과). CAD 프로그램이 정상 출력한 파일에는 거의 필요 없어서 끈다.
+# 결과가 이상하면(부피 0 이하 등) 보정을 모두 켠 정밀 모드로 자동 재시도한다.
+FAST_FIX = {"FixShape.FixSelfIntersectionMode": "0", "FixShape.FixIntersectingWiresMode": "0"}
+
+SURF_NAMES = {  # GeomAbs_SurfaceType 순서
+    0: "PLANE", 1: "CYLINDER", 2: "CONE", 3: "SPHERE", 4: "TORUS", 5: "BEZIER", 6: "BSPLINE",
+    7: "REVOLUTION", 8: "EXTRUSION", 9: "OFFSET", 10: "OTHER",
+}
+
+
+def _check_step_text(text: str) -> str:
+    text = text.lstrip("\ufeff \t\r\n")
+    if not text.upper().startswith("ISO-10303-21"):
+        raise ValueError(
+            "STEP 형식이 아닙니다. 첫 줄이 'ISO-10303-21;' 인지 확인하세요. "
+            "메모장에서 Ctrl+A로 전체 선택 후 복사했는지도 확인해 주세요. "
+            f"(읽은 길이 {len(text)}자)"
+        )
+    if "END-ISO-10303-21" not in text.upper():
+        raise ValueError("내용이 중간에서 끊겼습니다. 끝 줄 'END-ISO-10303-21;'까지 전체 복사해야 합니다.")
+    return text
+
+
+def load_shape_from_text(text: str, full_fix: bool = False):
+    """STEP 텍스트를 임시 영문 파일로 내려 형상(TopoDS_Shape)을 읽습니다. 사본은 읽고 바로 지워집니다."""
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.Interface import Interface_Static
+    from OCP.Resource import Resource_DataMapOfAsciiStringAsciiString
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.TCollection import TCollection_AsciiString
+
+    text = _check_step_text(text)
+    Interface_Static.SetCVal_s("xstep.cascade.unit", "MM")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d) / "model.stp"
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        reader = STEPControl_Reader()
+        if reader.ReadFile(str(tmp)) != IFSelect_RetDone:
+            raise ValueError("STEP 파일을 해석하지 못했습니다.")
+    if not full_fix:
+        m = Resource_DataMapOfAsciiStringAsciiString()
+        for k, v in FAST_FIX.items():
+            m.Bind(TCollection_AsciiString(k), TCollection_AsciiString(v))
+        reader.SetShapeFixParameters(m)
+    reader.TransferRoots()
+    shape = reader.OneShape()  # 여러 몸체가 있으면 전부 묶어서 가져옴
+    if shape is None or shape.IsNull():
+        raise ValueError("STEP에서 형상을 읽지 못했습니다.")
+    return shape
+
+
+def _faces(shape):
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopoDS import TopoDS
+    e = TopExp_Explorer(shape, TopAbs_FACE)
+    while e.More():
+        yield TopoDS.Face_s(e.Current())
+        e.Next()
+
+
+def exact_bbox(shape):
+    """정확한 외형 치수. 빠른 근사 상자로 '바깥쪽에 닿는 면'만 골라 그 면들만 정밀 계산한다.
+    (모든 면을 정밀 계산하면 복잡한 형상에서 1초 이상 걸림)"""
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    faces = list(_faces(shape))
+    if not faces:
+        b = Bnd_Box()
+        BRepBndLib.AddOptimal_s(shape, b, False, False)
+        return b.Get()
+    rough = []
+    for f in faces:
+        b = Bnd_Box()
+        BRepBndLib.Add_s(f, b, False)
+        rough.append(b.Get())
+    exact = {}
+
+    def refine(idx):
+        for i in idx:
+            b = Bnd_Box()
+            BRepBndLib.AddOptimal_s(faces[i], b, False, False)
+            exact[i] = b.Get()
+
+    lo = [min(r[k] for r in rough) for k in range(3)]
+    hi = [max(r[k + 3] for r in rough) for k in range(3)]
+    # 1) 근사 경계에 닿는 면 중 해석적 곡면(평면·원통 등, 정밀 계산이 빠름)만 먼저 정밀 계산
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    touching = [i for i, r in enumerate(rough)
+                if any(r[k] <= lo[k] + 1e-9 or r[k + 3] >= hi[k] - 1e-9 for k in range(3))]
+    simple = []
+    for i in touching:
+        try:
+            if int(BRepAdaptor_Surface(faces[i], False).GetType()) <= 4:  # PLANE..TORUS
+                simple.append(i)
+        except Exception:
+            pass
+    refine(simple or touching)
+    while True:
+        known = list(exact.values())
+        lo = [min(b[k] for b in known) for k in range(3)]
+        hi = [max(b[k + 3] for b in known) for k in range(3)]
+        # 2) 정밀 계산 안 한 면 중 근사 상자가 현재 경계 밖으로 나가는 면이 있으면 그 면도 정밀 계산 후 반복
+        out = [i for i, r in enumerate(rough) if i not in exact and
+               any(r[k] < lo[k] - 1e-9 or r[k + 3] > hi[k] + 1e-9 for k in range(3))]
+        if not out:
+            break
+        refine(out)
+    return (*lo, *hi)
+
+
+def _volume(shape) -> float:
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    g = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, g)
+    return g.Mass()
+
+
+def analyze_text(text: str, name: str, default_density: float | None = None, full_fix: bool = False) -> dict:
+    import time as _t
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Circle
+    from OCP.TopAbs import TopAbs_EDGE
+    from OCP.TopExp import TopExp
+    from OCP.TopoDS import TopoDS
+    from OCP.TopTools import TopTools_IndexedMapOfShape
+
+    t0 = _t.perf_counter()
+    shape = load_shape_from_text(text, full_fix)
+    t1 = _t.perf_counter()
+    volume = _volume(shape)  # mm^3
+    if not full_fix and not volume > 1e-9:
+        # 빠른 모드 결과가 이상하면(부피 0 이하) 형상 보정을 모두 켜고 다시 읽는다
+        shape = load_shape_from_text(text, True)
+        volume = _volume(shape)
+        full_fix = True
+        t1 = _t.perf_counter()
+    t2 = _t.perf_counter()
+    x0, y0, z0, x1, y1, z1 = exact_bbox(shape)
+    t3 = _t.perf_counter()
+    meta = read_step_meta(text)
+    density = meta["density"] or default_density
+    mass = volume / 1000.0 * density if density else None
+
+    face_types, nfaces = Counter(), 0
+    for f in _faces(shape):
+        nfaces += 1
+        try:
+            face_types[SURF_NAMES.get(int(BRepAdaptor_Surface(f, False).GetType()), "OTHER")] += 1
+        except Exception:
+            face_types["OTHER"] += 1
+
+    # 원형 모서리의 지름 목록: 구멍, 외경, 필렛 경계 등을 한눈에 보기 위함 (같은 모서리는 한 번만)
+    diams = Counter()
+    emap = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(shape, TopAbs_EDGE, emap)
+    for i in range(1, emap.Extent() + 1):
+        e = TopoDS.Edge_s(emap.FindKey(i))
+        try:
+            if BRep_Tool.Degenerated_s(e):
+                continue
+            c = BRepAdaptor_Curve(e)
+            if c.GetType() == GeomAbs_Circle:
+                diams[round(c.Circle().Radius() * 2, 3)] += 1
+        except Exception:
+            pass
+    t4 = _t.perf_counter()
+    detail = {"import": round(t1 - t0, 1), "bbox": round(t3 - t2, 1),
+              "volume": round(t2 - t1, 1), "rest": round(t4 - t3, 1)}
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+
+    return {
+        "file": name,
+        "part": meta["part"],
+        "material": meta["material"],
+        "density_g_cm3": density,
+        "file_density": meta["density"],
+        "timing_detail": detail,
+        "fix_mode": "full" if full_fix else "fast",
+        "software": meta["software"],
+        "color": meta["color"],
+        "size_x": round(dx, 3),
+        "size_y": round(dy, 3),
+        "size_z": round(dz, 3),
+        "volume_mm3": round(volume, 2),
+        "mass_g": round(mass, 3) if mass is not None else None,
+        "faces": nfaces,
+        "face_types": dict(face_types),
+        "circle_diameters": dict(sorted(diams.items())),
+        "_shape": shape,
+        "_meshp": mesh_params((dx * dx + dy * dy + dz * dz) ** 0.5, nfaces),
+    }
+
+
+def analyze_file(path: Path, default_density: float | None = None, full_fix: bool = False) -> dict:
+    try:
+        raw = path.read_bytes()
+    except OSError as ex:
+        raise ValueError(f"파일을 읽을 수 없습니다: {ex}") from ex
+    text = raw.decode("utf-8", errors="replace")
+    return analyze_text(text, path.name, default_density, full_fix)
+
+
+def format_info(info: dict) -> str:
+    lines = [
+        f"출처      : {info['file']}",
+        f"품명      : {info['part'] or '-'}",
+        f"재질      : {info['material'] or '-'}"
+        + (f" (밀도 {info['density_g_cm3']:g} g/cm³)" if info["density_g_cm3"] else ""),
+        f"작성      : {info['software'] or '-'}",
+        f"외형 치수 : X {info['size_x']} × Y {info['size_y']} × Z {info['size_z']} mm",
+        f"부피      : {info['volume_mm3']} mm³",
+        "질량      : " + (f"{info['mass_g']} g" if info["mass_g"] is not None else "밀도 정보 없음"),
+        f"면 개수   : {info['faces']}  " + ", ".join(f"{k} {v}" for k, v in info["face_types"].items()),
+    ]
+    if info["circle_diameters"]:
+        lines.append(
+            "원형 모서리 지름(mm): "
+            + ", ".join(f"Ø{d:g}×{n}" for d, n in info["circle_diameters"].items())
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 3D 표시
+def format_overlay(info: dict) -> str:
+    """3D 창 안에 쓰는 글자. 기본 글꼴에 한글이 없어서 영문 라벨과 ASCII만 씁니다."""
+    ascii_part = info["part"] if info["part"].isascii() else info["file"]
+    lines = [
+        info["file"] if info["file"].isascii() else ascii_part,
+        f"Part: {ascii_part}",
+        f"Size: {info['size_x']} x {info['size_y']} x {info['size_z']} mm",
+        f"Volume: {info['volume_mm3']} mm3",
+    ]
+    if info["mass_g"] is not None:
+        mat = info["material"] if info["material"].isascii() else ""
+        lines.append(f"Mass: {info['mass_g']} g  {mat} ({info['density_g_cm3']:g} g/cm3)".rstrip())
+    return "\n".join(lines)
+
+
+def mesh_params(diag: float, nfaces: int):
+    """형상 크기와 면 개수에 따라 메시 정밀도를 정한다. (공차 mm, 각도 rad)"""
+    tol = max(0.02, diag * 0.0004)  # 작은 부품은 0.02mm, 큰 부품은 크기에 비례해서 완화
+    # 면이 많을수록(형상이 복잡할수록) 단계적으로 완화.
+    if nfaces <= 100:
+        ang = 0.15
+    elif nfaces <= 300:
+        ang = 0.3
+    elif nfaces <= 1000:
+        ang = 0.45
+    elif nfaces <= 3000:
+        ang = 0.6
+        tol = max(tol, diag * 0.001)
+    else:
+        ang = 0.8
+        tol = max(tol, diag * 0.002)
+    return tol, ang
+
+
+def _mesh_shape(shape, tol: float, ang: float):
+    """1차: Delabella 알고리즘(기본 알고리즘보다 약 4배 빠름)으로 전체를 메시.
+    2차: Delabella 가 못 만든 면만 기본 알고리즘으로 채움(이미 된 면은 건너뜀). 모두 CPU 코어 병렬."""
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    try:
+        from OCP.BRepMesh import (BRepMesh_DelabellaMeshAlgoFactory, BRepMesh_EdgeDiscret, BRepMesh_FaceDiscret,
+                                  BRepMesh_ModelBuilder, BRepMesh_ModelHealer, BRepMesh_ModelPostProcessor,
+                                  BRepMesh_ModelPreProcessor)
+        from OCP.IMeshTools import IMeshTools_Context
+        ctx = IMeshTools_Context()
+        ctx.SetModelBuilder(BRepMesh_ModelBuilder())
+        ctx.SetEdgeDiscret(BRepMesh_EdgeDiscret())
+        ctx.SetModelHealer(BRepMesh_ModelHealer())
+        ctx.SetPreProcessor(BRepMesh_ModelPreProcessor())
+        ctx.SetFaceDiscret(BRepMesh_FaceDiscret(BRepMesh_DelabellaMeshAlgoFactory()))
+        ctx.SetPostProcessor(BRepMesh_ModelPostProcessor())
+        mesher = BRepMesh_IncrementalMesh()
+        mesher.SetShape(shape)
+        prm = mesher.ChangeParameters()
+        prm.Deflection, prm.Angle, prm.InParallel = tol, ang, True
+        mesher.Perform(ctx)
+    except Exception:
+        pass
+    BRepMesh_IncrementalMesh(shape, tol, False, ang, True)  # 빈 면 채우기 (또는 1차 실패 시 전체)
+
+
+def build_mesh(shape, params=None):
+    """OpenCascade 메시 → 바이너리 STL → pyvista. (점마다 파이썬 객체를 만들지 않아 빠름)"""
+    import pyvista as pv
+
+    if params is None:
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+        b = Bnd_Box()
+        BRepBndLib.Add_s(shape, b, False)
+        x0, y0, z0, x1, y1, z1 = b.Get()
+        params = mesh_params(((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2) ** 0.5, sum(1 for _ in _faces(shape)))
+    tol, ang = params
+    _mesh_shape(shape, tol, ang)
+    from OCP.StlAPI import StlAPI_Writer
+    w = StlAPI_Writer()
+    w.ASCIIMode = False
+    fd, path = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        w.Write(shape, path)
+        mesh = pv.read(path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if mesh.n_cells == 0:
+        raise RuntimeError("3D 메시를 만들지 못했습니다.")
+    return mesh.clean()  # STL 은 삼각형마다 점이 따로라서 같은 위치 점을 합쳐야 모서리선이 제대로 나온다
+
+
+DEFAULT_COLOR = "#b0b7bd"  # 파일에 색이 없을 때 쓰는 은회색
+
+SHORTCUT_MEMO = (
+    "Mouse: L-drag = rotate,  Wheel = zoom,  Shift+L-drag or M-drag = pan\n"
+    "Keys : Space or A = auto-rotate,  Up/Down = rotate speed,  Q = quit\n"
+    "View : V = front,  T = top,  I = iso,  W = wireframe,  S = solid,  B = box on/off"
+)
+
+
+def show(info: dict, png: str | None = None, color: str | None = None):
+    """색상 우선순위: 직접 지정한 색 > STEP 파일에 적힌 색 > 은회색"""
+    import pyvista as pv
+
+    mesh = info["_mesh"] if info.get("_mesh") is not None else build_mesh(info["_shape"], info.get("_meshp"))
+    pl = pv.Plotter(off_screen=bool(png), window_size=(1100, 780), title="STEP viewer")
+    pl.add_mesh(mesh, color=color or info.get("color") or DEFAULT_COLOR,
+                smooth_shading=False, specular=0.4, split_sharp_edges=True)
+    # 면마다 따로 쪼개져 있으므로 면의 경계선이 곧 실제 모서리입니다.
+    edges = mesh.extract_feature_edges(feature_angle=35, boundary_edges=True, non_manifold_edges=False)
+    if edges.n_points:
+        pl.add_mesh(edges, color="#222222", line_width=1)
+    pl.add_axes()
+    pl.set_background("#eef0ee")
+    pl.add_text(format_overlay(info), position="upper_left", font_size=9, color="#1d2421")
+    bbox = pl.add_bounding_box(color="#999999", line_width=1)  # 사각 틀: B 키로 켜고 끔
+    bbox.SetVisibility(False)  # 기본은 꺼짐
+    pl.camera_position = "iso"
+    pl.renderer.reset_camera_clipping_range()
+
+    # 창 아래쪽 단축키 안내 (VTK 기본 글꼴에 한글이 없어 영문으로 표시)
+    pl.add_text(SHORTCUT_MEMO, position="lower_left", font_size=8, color="#1d2421", name="memo")
+
+    if png:
+        pl.show(screenshot=png, auto_close=True)
+        return
+
+    # ---- 자동 회전: Space(또는 A)로 켜고 끔, 위/아래 화살표로 속도 조절
+    # (+/- 는 VTK 기본 기능(선 굵기)과 겹쳐서 쓰지 않는다)
+    state = {"on": False, "speed": 1.0}   # speed: 프레임당 회전 각도(도)
+
+    def draw_status():
+        txt = (f"AUTO-ROTATE: ON  (speed {state['speed']:.1f})" if state["on"]
+               else "AUTO-ROTATE: OFF  (Space)")
+        pl.add_text(txt, position="lower_right", font_size=9, color="#1d2421", name="rot")
+
+    def toggle_rotate():
+        state["on"] = not state["on"]
+        draw_status()
+        pl.render()
+
+    def change_speed(delta):
+        state["speed"] = min(8.0, max(0.2, state["speed"] + delta))
+        draw_status()
+        pl.render()
+
+    def toggle_box():
+        bbox.SetVisibility(not bbox.GetVisibility())
+        pl.render()
+
+    draw_status()
+    pl.add_key_event("b", toggle_box)
+    pl.add_key_event("space", toggle_rotate)
+    pl.add_key_event("a", toggle_rotate)
+    pl.add_key_event("Up", lambda: change_speed(+0.5))
+    pl.add_key_event("Down", lambda: change_speed(-0.5))
+    pl.add_key_event("v", lambda: (pl.view_xy(), pl.render()))
+    pl.add_key_event("t", lambda: (pl.view_xz(), pl.render()))
+    pl.add_key_event("i", lambda: (pl.view_isometric(), pl.render()))
+
+    # 타이머 대신 직접 갱신 루프. 창을 닫은 뒤 그리기를 시도하면 프로그램이 죽으므로
+    # (access violation) 닫힘 신호를 받는 즉시 루프를 빠져나온다.
+    import time
+    closed = {"v": False}
+
+    def mark_closed(*_a):
+        closed["v"] = True
+
+    pl.show(interactive_update=True, auto_close=False)
+    for ev in ("ExitEvent", "DeleteEvent"):
+        try:
+            pl.iren.add_observer(ev, mark_closed)
+        except Exception:
+            pass
+
+    def window_alive():
+        if closed["v"] or getattr(pl, "_closed", False):
+            return False
+        try:
+            return bool(pl.ren_win.GetMapped())
+        except Exception:
+            return False
+
+    try:
+        while window_alive():
+            pl.iren.process_events()          # 마우스·키 입력 처리 (여기서 창이 닫힐 수 있음)
+            if not window_alive():
+                break
+            if state["on"]:
+                pl.camera.Azimuth(state["speed"])
+            # 회전·확대·이동으로 모델과 카메라 거리가 바뀌면 앞뒤 절단면(clipping)이 맞지 않아
+            # 모델이 잘려 보이므로, 매 프레임 모델 크기에 맞게 다시 계산한다.
+            pl.renderer.reset_camera_clipping_range()
+            pl.render()
+            time.sleep(0.015)
+    except Exception:
+        pass
+    finally:
+        # 이미 닫힌 창은 건드리지 않는다. 아직 남아 있을 때만 정리.
+        if not closed["v"] and not getattr(pl, "_closed", False):
+            try:
+                pl.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- 입력
+def get_clipboard_text() -> str:
+    import tkinter as tk
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        return root.clipboard_get()
+    except tk.TclError:
+        return ""
+    finally:
+        root.destroy()
+
+
+def pick_file() -> Path | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    p = filedialog.askopenfilename(title="STEP 파일 선택", filetypes=[("STEP", "*.stp *.step"), ("모든 파일", "*.*")])
+    root.destroy()
+    return Path(p) if p else None
+
+
+def batch(folder: Path, out_csv: Path, density: float | None):
+    rows = []
+    files = sorted(p for p in folder.rglob("*") if p.suffix.lower() in STEP_EXTS)
+    for p in files:
+        try:
+            info = analyze_file(p, density)
+            info.pop("_shape")
+            for k in ("file_density", "_meshp", "timing_detail"):
+                info.pop(k, None)
+            info["face_types"] = "; ".join(f"{k}:{v}" for k, v in info["face_types"].items())
+            info["circle_diameters"] = "; ".join(f"{d:g}x{n}" for d, n in info["circle_diameters"].items())
+            rows.append(info)
+            print(f"OK  {p.name}")
+        except Exception as ex:  # 한 파일이 실패해도 나머지는 계속
+            print(f"실패 {p.name}: {ex}")
+            rows.append({"file": p.name, "part": f"읽기 실패: {ex}"})
+    if not rows:
+        print("STEP 파일을 찾지 못했습니다.")
+        return
+    keys = list(dict.fromkeys(k for r in rows for k in r))
+    with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: 엑셀에서 한글 정상 표시
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\n{len(rows)}개 파일 → {out_csv}")
+
+
+class _WinNotepad:
+    """윈도우 전용 부분: 메모장 실행, 창 찾기, 입력칸 글자 읽기, (예비) Ctrl+A/C, 닫기."""
+
+    EDIT_CLASSES = ("Edit", "RichEditD2DPT", "RICHEDIT50W", "RichEdit20W", "RichEdit20A")
+
+    def __init__(self):
+        import ctypes
+        self.ct = ctypes
+        self.u = ctypes.windll.user32
+        c, u = ctypes, self.u
+        self.PROC = c.WINFUNCTYPE(c.c_bool, c.c_void_p, c.c_void_p)
+        u.EnumWindows.argtypes = [self.PROC, c.c_void_p]
+        u.EnumChildWindows.argtypes = [c.c_void_p, self.PROC, c.c_void_p]
+        u.IsWindowVisible.argtypes = [c.c_void_p]
+        u.GetWindowTextLengthW.argtypes = [c.c_void_p]
+        u.GetWindowTextW.argtypes = [c.c_void_p, c.c_wchar_p, c.c_int]
+        u.GetClassNameW.argtypes = [c.c_void_p, c.c_wchar_p, c.c_int]
+        u.ShowWindow.argtypes = [c.c_void_p, c.c_int]
+        u.SetForegroundWindow.argtypes = [c.c_void_p]
+        u.GetForegroundWindow.restype = c.c_void_p
+        u.PostMessageW.argtypes = [c.c_void_p, c.c_uint, c.c_size_t, c.c_ssize_t]
+        u.SendMessageW.argtypes = [c.c_void_p, c.c_uint, c.c_size_t, c.c_void_p]
+        u.SendMessageW.restype = c.c_ssize_t
+        self.proc = None
+
+    def _cls(self, h):
+        b = self.ct.create_unicode_buffer(256)
+        self.u.GetClassNameW(h, b, 256)
+        return b.value
+
+    def _title(self, h):
+        n = self.u.GetWindowTextLengthW(h)
+        if not n:
+            return ""
+        b = self.ct.create_unicode_buffer(n + 1)
+        self.u.GetWindowTextW(h, b, n + 1)
+        return b.value
+
+    def _enum(self, parent=None):
+        out = []
+
+        def cb(h, _):
+            out.append(h)
+            return True
+
+        proc = self.PROC(cb)  # 호출이 끝날 때까지 참조를 유지
+        if parent is None:
+            self.u.EnumWindows(proc, 0)
+        else:
+            self.u.EnumChildWindows(parent, proc, 0)
+        return out
+
+    def _notepad_windows(self):
+        res = []
+        for h in self._enum():
+            if not self.u.IsWindowVisible(h):
+                continue
+            c, t = self._cls(h), self._title(h)
+            if c == "Notepad" or t.endswith("메모장") or t.endswith("Notepad"):
+                res.append((h, c, t))
+        return res
+
+    def snapshot(self):
+        return {h for h, _, _ in self._notepad_windows()}
+
+    def launch(self, path):
+        import subprocess
+        self.proc = subprocess.Popen(["notepad.exe", str(path)])
+
+    def find_window(self, base, before):
+        """실행 전에 없던 메모장 창 > 제목에 파일명이 든 창 > 맨 앞의 메모장 창 순서로 찾는다."""
+        import unicodedata
+        wins = self._notepad_windows()
+        new = [h for h, _, _ in wins if h not in before]
+        if new:
+            return new[0]
+        nb = unicodedata.normalize("NFC", base).lower()  # 한글 자모 분리 표기 차이를 흡수
+        for h, _, t in wins:
+            if nb in unicodedata.normalize("NFC", t).lower():
+                return h
+        fg = self.u.GetForegroundWindow()
+        for h, _, _ in wins:
+            if h == fg:
+                return h
+        return None
+
+    def read_text(self, hwnd):
+        """메모장 입력칸의 글자를 직접 읽는다(키보드·클립보드를 쓰지 않음)."""
+        ct, u = self.ct, self.u
+        best = ""
+        for ch in self._enum(hwnd):
+            if self._cls(ch) not in self.EDIT_CLASSES:
+                continue
+            n = u.SendMessageW(ch, 0x000E, 0, None)  # WM_GETTEXTLENGTH
+            if n and n > 0:
+                buf = ct.create_unicode_buffer(n + 1)
+                u.SendMessageW(ch, 0x000D, n + 1, ct.addressof(buf))  # WM_GETTEXT
+                if len(buf.value) > len(best):
+                    best = buf.value
+        return best
+
+    def focus(self, hwnd):
+        u = self.u
+        u.keybd_event(0x12, 0, 0, 0)  # Alt를 눌렀다 떼서 윈도우의 포커스 이동 제한을 푼다
+        u.keybd_event(0x12, 0, 2, 0)
+        u.ShowWindow(hwnd, 9)  # SW_RESTORE
+        u.SetForegroundWindow(hwnd)
+        return u.GetForegroundWindow() == hwnd
+
+    def copy_all(self):
+        import time
+        u = self.u
+        for key in (0x41, 0x43):  # A, C
+            u.keybd_event(0x11, 0, 0, 0)
+            u.keybd_event(key, 0, 0, 0)
+            u.keybd_event(key, 0, 2, 0)
+            u.keybd_event(0x11, 0, 2, 0)
+            time.sleep(0.4)
+
+    def close(self, hwnd):
+        self.u.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+
+    def diagnose(self):
+        lines = []
+        if self.proc is not None:
+            lines.append(f"notepad.exe 종료코드: {self.proc.poll()} (None=실행 중)")
+        wins = self._notepad_windows()
+        lines.append(f"메모장으로 보이는 창 {len(wins)}개" + "".join(f"\n  [{c}] {t[:50]}" for _, c, t in wins[:5]))
+        return "\n".join(lines)
+
+
+def _is_complete_step(text: str) -> bool:
+    t = text.strip().upper()
+    return t.startswith("ISO-10303-21") and "END-ISO-10303-21" in t[-80:]
+
+
+def grab_text_via_notepad(path, tk_root, log=lambda m: None, backend=None, timeout=15, read_timeout=15):
+    """파일을 메모장으로 열어 내용을 가져온 뒤 메모장을 닫습니다. 저장은 하지 않습니다.
+    1단계: 메모장 입력칸의 글자를 직접 읽음 / 2단계(예비): Ctrl+A, Ctrl+C 후 클립보드에서 읽음"""
+    import time
+    if backend is None:
+        if sys.platform != "win32":
+            raise RuntimeError("이 기능은 윈도우에서만 동작합니다.")
+        backend = _WinNotepad()
+
+    before = backend.snapshot()
+    log("메모장으로 파일을 여는 중입니다. 끝날 때까지 키보드와 마우스를 건드리지 마세요.")
+    backend.launch(path)
+    hwnd, end = None, time.time() + timeout
+    while time.time() < end:
+        hwnd = backend.find_window(Path(path).name, before)
+        if hwnd:
+            break
+        tk_root.update()
+        time.sleep(0.1)
+    if not hwnd:
+        raise RuntimeError("메모장 창을 찾지 못했습니다.\n" + backend.diagnose())
+
+    try:
+        log("메모장에서 내용을 읽는 중입니다...")
+        text, end = "", time.time() + read_timeout
+        while time.time() < end:
+            t = backend.read_text(hwnd)
+            if t and _is_complete_step(t):
+                return t
+            tk_root.update()
+            time.sleep(0.12)
+
+        log("직접 읽기가 안 되어 복사 방식으로 시도합니다...")
+        try:
+            prev = tk_root.clipboard_get()
+        except Exception:
+            prev = ""
+        try:
+            focused = False
+            for _ in range(3):
+                if backend.focus(hwnd):
+                    focused = True
+                    break
+                time.sleep(0.5)
+            if not focused:
+                raise RuntimeError("메모장 창을 앞으로 가져오지 못했습니다.\n" + backend.diagnose())
+            backend.copy_all()
+            end = time.time() + read_timeout
+            while time.time() < end:
+                try:
+                    t = tk_root.clipboard_get()
+                except Exception:
+                    t = ""
+                if t and _is_complete_step(t):
+                    return t
+                tk_root.update()
+                time.sleep(0.3)
+        finally:
+            tk_root.clipboard_clear()  # 가져온 내용이 클립보드에 남지 않게 하고, 원래 내용을 되돌림
+            if prev:
+                tk_root.clipboard_append(prev)
+        raise RuntimeError(
+            "메모장에서 STEP 내용을 가져오지 못했습니다. 입력칸 직접 읽기와 복사가 모두 실패했습니다.\n"
+            "문서 보안이 막았거나, 파일이 아직 다 열리지 않았을 수 있습니다.\n" + backend.diagnose()
+        )
+    finally:
+        backend.close(hwnd)
+
+
+# ---------------------------------------------------------------- 기록 저장
+HIST_DIR = APP_DIR / "step_history"
+HIST_INDEX = HIST_DIR / "history.json"
+HIST_CSV = HIST_DIR / "history.csv"  # 엑셀로 열어볼 수 있는 표
+
+
+def history_load() -> list:
+    import json
+    try:
+        return json.loads(HIST_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _history_write(items: list):
+    import json
+    HIST_DIR.mkdir(exist_ok=True)
+    HIST_INDEX.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    with open(HIST_CSV, "w", encoding="utf-8-sig", newline="") as f:  # utf-8-sig: 엑셀에서 한글 안 깨짐
+        w = csv.writer(f)
+        w.writerow(["열어본 시각", "파일명", "부품명", "재질", "X(mm)", "Y(mm)", "Z(mm)",
+                    "부피(mm3)", "밀도(g/cm3)", "질량(g)"])
+        for e in items:
+            w.writerow([e["saved_at"], e["name"], e["part"], e["material"], e["size_x"], e["size_y"],
+                        e["size_z"], e["volume_mm3"], e["density"], e["mass_g"]])
+
+
+def history_add(text: str, info: dict, name: str) -> dict:
+    """모델링한 STEP 내용과 정보를 저장. 같은 내용이 이미 있으면 시각만 갱신해 맨 위로 올린다."""
+    import hashlib
+    import time as _t
+    HIST_DIR.mkdir(exist_ok=True)
+    sha = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+    items = [e for e in history_load()]
+    old = next((e for e in items if e.get("sha1") == sha), None)
+    if old:
+        items.remove(old)
+        stp = old["stp"]
+    else:
+        stp = f"{sha[:16]}/model.stp"
+    target = HIST_DIR / stp
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        target.write_bytes(text.encode("utf-8", errors="replace"))
+    entry = {
+        "sha1": sha, "stp": stp, "saved_at": _t.strftime("%Y-%m-%d %H:%M:%S"),
+        "name": name, "part": info.get("part", ""), "material": info.get("material", ""),
+        "size_x": info.get("size_x"), "size_y": info.get("size_y"), "size_z": info.get("size_z"),
+        "volume_mm3": info.get("volume_mm3"),
+        "density": None if info.get("density_g_cm3") is None else round(info["density_g_cm3"], 4),
+        "mass_g": info.get("mass_g"),
+    }
+    items.insert(0, entry)
+    _history_write(items)
+    return entry
+
+
+def history_text(entry: dict) -> str:
+    return (HIST_DIR / entry["stp"]).read_bytes().decode("utf-8", errors="replace")
+
+
+def history_delete(sha: str):
+    items = history_load()
+    for e in items:
+        if e.get("sha1") == sha:
+            try:
+                f = HIST_DIR / e["stp"]
+                if f.parent != HIST_DIR:      # 모델별 폴더(원본 STEP + 저장된 메시·정보)를 통째로 삭제
+                    import shutil
+                    shutil.rmtree(f.parent, ignore_errors=True)
+                else:                          # 예전 방식으로 저장된 파일
+                    f.unlink()
+            except OSError:
+                pass
+    _history_write([e for e in items if e.get("sha1") != sha])
+
+
+def model_dir(text: str) -> Path:
+    """같은 STEP 내용이면 항상 같은 폴더 → 이미 계산한 결과를 재사용한다."""
+    import hashlib
+    sha = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+    return HIST_DIR / sha[:16]
+
+
+def load_cached(d: Path, name: str, default_density: float | None):
+    """저장된 info.json + mesh.vtp 를 읽는다. 없으면 None. 질량은 현재 밀도 입력값으로 다시 계산."""
+    import json
+    import pyvista as pv
+    try:
+        info = json.loads((d / "info.json").read_text(encoding="utf-8"))
+        info["_mesh"] = pv.read(str(d / "mesh.vtp"))
+    except Exception:
+        return None
+    info["circle_diameters"] = {float(k): v for k, v in info.get("circle_diameters", [])}
+    info["file"] = name
+    dens = info.get("file_density") or default_density
+    info["density_g_cm3"] = dens
+    info["mass_g"] = round(info["volume_mm3"] / 1000.0 * dens, 3) if dens else None
+    return info
+
+
+def _ensure_std_streams():
+    """창 모드 exe 에서는 sys.stdin/stdout 이 None 일 수 있어, 부모가 넘겨준 파이프 핸들로 직접 연결한다."""
+    if sys.stdin is not None and sys.stdout is not None:
+        return
+    import io
+    try:
+        import ctypes
+        import msvcrt
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.restype = ctypes.c_void_p
+        if sys.stdin is None:
+            fd = msvcrt.open_osfhandle(k32.GetStdHandle(-10), os.O_RDONLY)
+            sys.stdin = io.TextIOWrapper(io.FileIO(fd, "r"), encoding="utf-8")
+        if sys.stdout is None:
+            fd = msvcrt.open_osfhandle(k32.GetStdHandle(-11), 0)
+            sys.stdout = io.TextIOWrapper(io.FileIO(fd, "w"), encoding="utf-8", line_buffering=True)
+    except Exception:
+        pass
+
+
+def worker_main():
+    """별도 프로세스로 돌면서 무거운 계산(STEP 해석 + 메시 생성)만 담당한다.
+    메인 창은 그동안 멈추지 않고 진행 상황을 표시할 수 있다."""
+    import json
+    import time
+    import traceback
+
+    _ensure_std_streams()
+    try:
+        sys.stdin.reconfigure(encoding="utf-8")
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    def send(**kw):
+        print("@@" + json.dumps(kw, ensure_ascii=False), flush=True)
+
+    try:
+        import numpy  # noqa: F401
+        import pyvista  # noqa: F401
+        preload_occ()
+    except Exception as ex:
+        send(kind="warn", msg=repr(ex))
+    send(kind="ready")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        jid = None
+        try:
+            job = json.loads(line)
+            jid = job["id"]
+            d = Path(job["dir"])
+            t0 = time.perf_counter()
+            send(kind="stage", job=jid, msg="STEP 해석 중 (형상 변환)")
+            text = (d / "model.stp").read_bytes().decode("utf-8", errors="replace")
+            info = analyze_text(text, job.get("name", "pasted"), job.get("density"), bool(job.get("full_fix")))
+            t1 = time.perf_counter()
+            send(kind="stage", job=jid, msg="3D 메시 생성 중 (모든 CPU 코어 사용)")
+            params = info.pop("_meshp", None)
+            mesh = build_mesh(info.pop("_shape"), params)
+            t2 = time.perf_counter()
+            mesh.save(str(d / "mesh.vtp"))
+            info["circle_diameters"] = [[k, v] for k, v in info["circle_diameters"].items()]
+            info["timing"] = {"parse": round(t1 - t0, 1), "mesh": round(t2 - t1, 1), **{"d_" + k: v for k, v in info.get("timing_detail", {}).items()}}
+            (d / "info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+            send(kind="done", job=jid)
+        except BaseException:
+            send(kind="error", job=jid, msg=traceback.format_exc())
+
+
+LOG_PATH = APP_DIR / "step_viewer_error.log"
+
+
+def show_error_box(title: str, msg: str, parent=None):
+    """오류 내용을 팝업 창으로 보여 주고, 같은 내용을 로그 파일에도 남긴다."""
+    try:
+        import time as _t
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"\n[{_t.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n{msg}\n")
+    except Exception:
+        pass
+    try:
+        from tkinter import messagebox
+        messagebox.showerror(title, msg[-3000:] + f"\n\n(로그 파일: {LOG_PATH})", parent=parent)
+    except Exception:
+        print(f"[{title}]\n{msg}", file=sys.stderr)
+
+
+def gui(a):
+    """메인 창: [파일 선택 → 자동 모델링] 한 번이면 메모장 열기 → 내용 읽기 → 모델링까지 진행."""
+    import tkinter as tk
+    from tkinter import scrolledtext, ttk
+
+    root = tk.Tk()
+    root.title("STEP 모델링")
+    # 더블클릭으로 실행된 경우(단독 모드): 메인 창 없이 로딩 창 → 3D 창만 보여 주고, 3D 창을 닫으면 종료
+    single = bool(getattr(a, "gui_open", None))
+    if single:
+        root.withdraw()
+
+    def quit_if_single():
+        if single:
+            root.after(50, lambda: on_close())
+
+    import traceback
+    import faulthandler
+    # 이전 실행이 (오류 창도 못 띄우고) 갑자기 죽었다면 남은 기록을 먼저 보여 준다
+    try:
+        prev_log = LOG_PATH.with_suffix(".crash.log")
+        if prev_log.exists() and prev_log.stat().st_size > 0:
+            txt = prev_log.read_text(encoding="utf-8", errors="replace")
+            prev_log.write_text("", encoding="utf-8")
+            show_error_box("이전 실행이 비정상 종료되었습니다", txt, root)
+        crash_f = open(prev_log, "a", encoding="utf-8")
+        faulthandler.enable(file=crash_f, all_threads=True)
+    except Exception:
+        pass
+
+    def on_tk_error(exc, val, tb):
+        show_error_box("프로그램 오류", "".join(traceback.format_exception(exc, val, tb)), root)
+
+    root.report_callback_exception = on_tk_error
+
+    def preload():
+        try:  # 사용자가 파일을 고르는 동안 무거운 라이브러리를 미리 불러옴
+            import numpy  # noqa: F401
+            import pyvista  # noqa: F401
+        except Exception:
+            pass  # 실패해도 실제 사용할 때 다시 불러오며 오류를 보여 줌
+
+    import threading
+    threading.Thread(target=preload, daemon=True).start()
+    root.geometry("800x760")
+    frm = ttk.Frame(root, padding=10)
+    frm.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frm,
+        text="[파일 선택 → 자동 모델링]을 누르고 STEP 파일을 고르세요.\n"
+             "메모장이 잠깐 열렸다 닫히며 자동으로 모델링됩니다. 진행 중에는 키보드와 마우스를 건드리지 마세요.",
+    ).pack(anchor="w")
+
+    bar = ttk.Frame(frm)
+    bar.pack(fill="x", pady=(8, 0))
+    color_var = tk.StringVar(value=a.color or "")
+    dens_var = tk.StringVar(value="" if a.density is None else str(a.density))
+    ttk.Label(bar, text="밀도 g/cm³ (파일에 없을 때만):").pack(side="left")
+    ttk.Entry(bar, textvariable=dens_var, width=7).pack(side="left", padx=(4, 12))
+    # 형상이 깨져 보일 때만 켜는 옵션: STEP 형상 보정을 모두 수행(느림). 켜면 저장된 결과도 무시하고 다시 계산.
+    fullfix_var = tk.BooleanVar(value=bool(getattr(a, "full_fix", False)))
+
+    out = scrolledtext.ScrolledText(frm, height=14, state="disabled", font=("Malgun Gothic", 10))
+    out.pack(fill="both", expand=True, pady=(8, 0))
+
+    def set_out(msg):
+        out.config(state="normal")
+        out.delete("1.0", "end")
+        out.insert("end", msg)
+        out.config(state="disabled")
+        root.update_idletasks()
+
+    # ---- 무거운 계산(STEP 해석·메시 생성)은 별도 프로세스에서: 계산 중에도 이 창이 멈추지 않는다
+    import json
+    import queue
+    import subprocess
+    import time as _time
+
+    wk = {"proc": None, "q": queue.Queue(), "ready": False, "busy": False, "jid": 0}
+
+    def start_worker():
+        try:
+            HIST_DIR.mkdir(exist_ok=True)
+            flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW: 검은 창이 뜨지 않게
+            logf = open(LOG_PATH.with_name("step_worker.log"), "a", encoding="utf-8")
+            proc = subprocess.Popen(
+                self_command() + ["--worker"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=logf,
+                text=True, encoding="utf-8", bufsize=1, creationflags=flags,
+            )
+        except Exception:
+            wk["proc"] = None
+            return
+
+        wk["proc"], wk["ready"] = proc, False
+
+        def reader():
+            for line in proc.stdout:
+                if line.startswith("@@"):
+                    try:
+                        wk["q"].put(json.loads(line[2:]))
+                    except Exception:
+                        pass
+            wk["q"].put({"kind": "exit"})
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def finish(info, text, name, from_history, note):
+        if not from_history:
+            try:  # 저장에 실패해도 모델링은 계속 진행
+                history_add(text, info, name)
+                refresh_hist()
+            except Exception as ex:
+                set_out(f"[기록 저장 실패] {ex}")
+        src = "직접 선택한 색" if color_var.get() else ("파일에 적힌 색" if info["color"] else "기본 은회색")
+        set_out(format_info(info) + f"\n색상      : {color_var.get() or info['color'] or DEFAULT_COLOR} ({src})"
+                + (f"\n{note}" if note else "") + "\n\n3D 창을 닫으면 이 창으로 돌아옵니다.")
+        try:
+            show(info, None, color_var.get() or None)
+        except BaseException as ex:  # SystemExit 등으로 프로그램이 같이 닫히는 것도 막는다
+            set_out(format_info(info) + f"\n\n[3D 표시 실패] {ex!r}")
+            show_error_box("3D 표시 실패", traceback.format_exc(), root)
+        finally:
+            if single:
+                quit_if_single()
+            else:
+                try:
+                    root.deiconify()
+                    root.lift()
+                except Exception:
+                    pass
+
+    def run(text, name="pasted", from_history=False):
+        if wk["busy"]:
+            return
+        try:
+            dens = float(dens_var.get()) if dens_var.get().strip() else None
+        except ValueError:
+            set_out("[실패] 밀도는 숫자로 입력해 주세요. 예: 8.94")
+            quit_if_single()
+            return
+
+        d = model_dir(text)
+        # 1) 이미 계산해 둔 모델이면 계산 없이 바로 연다
+        if not fullfix_var.get() and (d / "info.json").exists() and (d / "mesh.vtp").exists():
+            info = load_cached(d, name, dens)
+            if info is not None:
+                finish(info, text, name, from_history, "저장된 결과를 불러와 바로 열었습니다 (계산 생략)")
+                return
+
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.stp").write_bytes(text.encode("utf-8", errors="replace"))
+
+        # 2) 작업 프로세스에 계산을 맡긴다. 프로세스가 없으면 다시 띄워 보고, 그래도 안 되면 이 창에서 직접 계산(창이 잠시 멈춤)
+        if wk["proc"] is None or wk["proc"].poll() is not None:
+            start_worker()
+        proc = wk["proc"]
+        if proc is None:
+            set_out("읽는 중... (이 창에서 직접 계산하므로 잠시 멈출 수 있습니다)")
+            try:
+                info = analyze_text(text, name, dens, fullfix_var.get())
+            except Exception:
+                set_out("[실패] 모델링 중 오류")
+                show_error_box("모델링 실패", traceback.format_exc(), root)
+                quit_if_single()
+                return
+            finish(info, text, name, from_history, "")
+            return
+
+        wk["jid"] += 1
+        jid = wk["jid"]
+        try:
+            proc.stdin.write(json.dumps({"id": jid, "dir": str(d), "name": name, "density": dens,
+                                         "full_fix": bool(fullfix_var.get())},
+                                        ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except Exception:
+            wk["proc"] = None
+            set_out("[실패] 계산 프로세스에 연결하지 못했습니다. 다시 시도해 주세요.")
+            if single:
+                show_error_box("계산 프로세스 연결 실패", "다시 더블클릭해 주세요.", root)
+            quit_if_single()
+            return
+        wk["busy"] = True
+        btn.config(state="disabled")
+        set_out(f"{name}\n\n계산 중입니다. 완료되면 3D 창이 열립니다.")
+        t0 = _time.perf_counter()
+        stage = {"msg": "계산 프로세스 준비 중 (처음 한 번만 몇 초 걸림)" if not wk["ready"] else "대기 중"}
+
+        # 계산하는 동안 '계산 중' 로딩 창 하나만 띄운다 (닫기 버튼 없음, 끝나면 자동으로 닫힘)
+        dlg = tk.Toplevel(root)
+        dlg.title("계산 중")
+        dlg.resizable(False, False)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        if not single:  # 메인 창이 숨겨져 있으면 transient 창도 같이 숨으므로 단독 모드에서는 쓰지 않는다
+            try:
+                dlg.transient(root)
+            except Exception:
+                pass
+        box = ttk.Frame(dlg, padding=20)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text="계산 중입니다...", font=("Malgun Gothic", 13, "bold")).pack()
+        stage_lbl = ttk.Label(box, text="", font=("Malgun Gothic", 10))
+        stage_lbl.pack(pady=(8, 2))
+        ttk.Label(box, text=name, font=("Malgun Gothic", 9)).pack()
+        bar_pb = ttk.Progressbar(box, mode="indeterminate", length=320)
+        bar_pb.pack(pady=(12, 4))
+        bar_pb.start(12)
+        try:  # 메인 창 가운데에 배치하고, 계산이 끝날 때까지 다른 조작을 막는다
+            root.update_idletasks()
+            w, h = 380, 170
+            if single:  # 화면 가운데
+                x = (dlg.winfo_screenwidth() - w) // 2
+                y = (dlg.winfo_screenheight() - h) // 2
+            else:      # 메인 창 가운데
+                x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+                y = root.winfo_rooty() + (root.winfo_height() - h) // 2
+            dlg.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+            dlg.grab_set()
+            dlg.lift()
+            dlg.focus_force()
+        except Exception:
+            pass
+
+        def close_dlg():
+            try:
+                bar_pb.stop()
+                dlg.grab_release()
+                dlg.destroy()
+            except Exception:
+                pass
+
+        def end(kind, msg=""):
+            close_dlg()
+            wk["busy"] = False
+            btn.config(state="normal")
+            if kind == "done":
+                info = load_cached(d, name, dens)
+                if info is None:
+                    set_out("[실패] 계산 결과 파일을 읽지 못했습니다.")
+                    show_error_box("결과 읽기 실패", f"{d}", root)
+                    quit_if_single()
+                    return
+                tm = info.get("timing") or {}
+                finish(info, text, name, from_history,
+                       f"소요 시간 : 해석 {tm.get('parse', '?')}초 + 메시 {tm.get('mesh', '?')}초 "
+                       f"(형상 보정: {'정밀' if info.get('fix_mode') == 'full' else '빠른'} 모드) "
+                       f"[해석 내역: STEP 변환 {tm.get('d_import', '?')} / 치수 {tm.get('d_bbox', '?')} / "
+                       f"부피 {tm.get('d_volume', '?')} / 기타 {tm.get('d_rest', '?')}]\n"
+                       "(같은 모델은 다음부터 저장된 결과로 즉시 열립니다)")
+            elif kind == "error":
+                set_out("[실패] 모델링 중 오류 (자세한 내용은 팝업 참고)")
+                show_error_box("모델링 실패", msg, root)
+                quit_if_single()
+            else:
+                wk["proc"] = None
+                set_out("[실패] 계산 프로세스가 갑자기 종료되었습니다.")
+                show_error_box("계산 프로세스 종료", f"자세한 기록: {LOG_PATH.with_name('step_worker.log')}", root)
+                quit_if_single()
+
+        def poll():
+            while True:
+                try:
+                    m = wk["q"].get_nowait()
+                except queue.Empty:
+                    break
+                k = m.get("kind")
+                if k == "ready":
+                    wk["ready"] = True
+                elif k == "stage" and m.get("job") == jid:
+                    stage["msg"] = m["msg"]
+                elif k == "done" and m.get("job") == jid:
+                    end("done")
+                    return
+                elif k == "error" and m.get("job") == jid:
+                    end("error", m.get("msg", ""))
+                    return
+                elif k == "exit":
+                    end("exit")
+                    return
+            el = _time.perf_counter() - t0
+            stage_lbl.config(text=f"{stage['msg']}  ({el:.0f}초 경과)")
+            root.after(150, poll)
+
+        poll()
+
+    def read_step_file(p: Path) -> str:
+        """먼저 파이썬으로 직접 읽어 보고(로컬 파일), 막혀 있으면(문서중앙화 드라이브 등) 메모장 방식으로 가져온다."""
+        try:
+            raw = p.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            if text.lstrip("\ufeff \t\r\n").upper().startswith("ISO-10303-21"):
+                return text
+        except OSError:
+            pass
+        return grab_text_via_notepad(p, root, set_out)
+
+    def open_path(p: Path):
+        if wk["busy"]:
+            return
+        try:
+            text = read_step_file(p)
+        except Exception as ex:
+            if not single:
+                root.lift()
+            set_out(f"[실패] {ex}")
+            show_error_box("파일 가져오기 실패", traceback.format_exc(), root)
+            quit_if_single()
+            return
+        if not single:
+            root.lift()
+        run(text, p.name)
+
+    def auto_run():
+        """한 번에: 파일 선택 → (필요하면 메모장으로 열어) 내용 가져오기 → 모델링"""
+        if wk["busy"]:
+            return
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(title="STEP 파일 선택", filetypes=[("STEP", "*.stp *.step"), ("모든 파일", "*.*")])
+        if not p:
+            return
+        open_path(Path(p))
+
+    def show_color_label():
+        color_lbl.config(text=color_var.get() or "파일 색상 사용")
+
+    def pick_color():
+        from tkinter import colorchooser
+        res = colorchooser.askcolor(title="모델 색상 선택")
+        if res and res[1]:
+            color_var.set(res[1])
+            show_color_label()
+
+    def reset_color():
+        color_var.set("")
+        show_color_label()
+
+    btn = ttk.Button(bar, text="파일 선택 → 자동 모델링", command=auto_run)
+    btn.pack(side="left", padx=4)
+    bar2 = ttk.Frame(frm)
+    bar2.pack(fill="x", pady=(6, 0))
+    ttk.Label(bar2, text="모델 색상:").pack(side="left")
+    color_lbl = ttk.Label(bar2, text="", width=16)
+    color_lbl.pack(side="left", padx=4)
+    ttk.Button(bar2, text="색상 선택", command=pick_color).pack(side="left", padx=4)
+    ttk.Button(bar2, text="파일 색상으로", command=reset_color).pack(side="left", padx=4)
+    ttk.Checkbutton(bar2, text="정밀 보정 (형상이 깨져 보일 때만, 느림)", variable=fullfix_var).pack(side="left", padx=(16, 0))
+    show_color_label()
+
+    # ---- 이전 기록: 열어본 모델을 자동 저장해 두고, 메모장 없이 다시 연다
+    hist_frm = ttk.LabelFrame(frm, text="이전 기록 (더블클릭하면 메모장 없이 바로 다시 모델링)", padding=6)
+    hist_frm.pack(fill="both", pady=(8, 0))
+    cols = ("time", "name", "size", "mass")
+    tree = ttk.Treeview(hist_frm, columns=cols, show="headings", height=6, selectmode="browse")
+    for c, t, w in (("time", "열어본 시각", 130), ("name", "파일명", 300),
+                    ("size", "치수 X×Y×Z (mm)", 170), ("mass", "질량 (g)", 80)):
+        tree.heading(c, text=t)
+        tree.column(c, width=w, anchor="w")
+    sb = ttk.Scrollbar(hist_frm, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=sb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    sb.pack(side="left", fill="y")
+    hist_items = []
+
+    def refresh_hist():
+        hist_items.clear()
+        hist_items.extend(history_load())
+        tree.delete(*tree.get_children())
+        for i, e in enumerate(hist_items):
+            size = f"{e['size_x']} × {e['size_y']} × {e['size_z']}"
+            mass = "-" if e.get("mass_g") is None else e["mass_g"]
+            tree.insert("", "end", iid=str(i), values=(e["saved_at"], e["name"], size, mass))
+
+    def selected_entry():
+        sel = tree.selection()
+        return hist_items[int(sel[0])] if sel else None
+
+    def open_hist(_evt=None):
+        e = selected_entry()
+        if not e:
+            return
+        try:
+            text = history_text(e)
+        except Exception as ex:
+            show_error_box("저장된 파일을 읽지 못했습니다", f"{e['stp']}\n{ex}", root)
+            return
+        run(text, e["name"], from_history=True)
+
+    def delete_hist():
+        from tkinter import messagebox
+        e = selected_entry()
+        if e and messagebox.askyesno("기록 삭제", f"'{e['name']}' 기록을 삭제할까요?\n(저장된 STEP 사본도 함께 지워집니다)", parent=root):
+            history_delete(e["sha1"])
+            refresh_hist()
+
+    def open_folder():
+        import os
+        HIST_DIR.mkdir(exist_ok=True)
+        os.startfile(str(HIST_DIR))  # 윈도우 전용 (history.csv 는 엑셀로 열림)
+
+    tree.bind("<Double-1>", open_hist)
+    hb = ttk.Frame(frm)
+    hb.pack(fill="x", pady=(4, 0))
+    ttk.Button(hb, text="선택한 기록 다시 열기", command=open_hist).pack(side="left", padx=2)
+    ttk.Button(hb, text="선택한 기록 삭제", command=delete_hist).pack(side="left", padx=2)
+    ttk.Button(hb, text="저장 폴더 열기 (엑셀 표 포함)", command=open_folder).pack(side="left", padx=2)
+    refresh_hist()
+    def on_close():
+        try:
+            if wk["proc"] is not None:
+                wk["proc"].kill()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    if getattr(a, "gui_open", None):  # STEP 파일을 더블클릭해서 실행된 경우: 창이 뜨면 바로 그 파일을 연다
+        root.after(400, lambda: open_path(Path(a.gui_open)))
+    start_worker()  # 파일을 고르는 동안 미리 라이브러리를 불러 두기 위해 창이 뜨자마자 시작
+    root.mainloop()
+    return 0
+
+
+def clipboard_loop(a):
+    print("메모장에서 STEP 파일을 열고 Ctrl+A → Ctrl+C 로 전체 복사한 뒤 Enter 를 누르세요. (종료: q)")
+    while True:
+        ans = input("> ").strip().lower()
+        if ans == "q":
+            return 0
+        text = get_clipboard_text()
+        if not text.strip():
+            print("[실패] 클립보드가 비어 있습니다. 메모장에서 다시 복사해 주세요.\n")
+            continue
+        try:
+            info = analyze_text(text, "clipboard", a.density)
+        except Exception as ex:
+            print(f"[실패] {ex}\n")
+            continue
+        print(format_info(info))
+        show(info, a.png, a.color)
+        if a.info or a.png:
+            return 0
+        print("\n다른 부품: 메모장에서 복사한 뒤 Enter (종료: q)")
+
+
+# ---------------------------------------------------------------- 파일 연결 (더블클릭으로 열기)
+PROGID = "StepViewer.STEP.1"
+LEGACY_PROGIDS = ("JAS.StepViewer.1",)  # 예전 버전에서 쓰던 이름: 등록/해제 때 같이 정리
+MENU_KEY = "StepViewerOpen"
+LEGACY_MENU_KEYS = ("JASStepViewer",)
+STEP_EXTS_REG = (".stp", ".step")
+
+
+def _open_command() -> str:
+    if FROZEN:  # exe 배포판
+        return f'"{Path(sys.executable).resolve()}" --gui-open "%1"'
+    exe = Path(sys.executable)
+    pyw = exe.with_name("pythonw.exe")  # 검은 콘솔 창 없이 실행
+    exe = pyw if pyw.exists() else exe
+    return f'"{exe}" "{Path(__file__).resolve()}" --gui-open "%1"'
+
+
+def _report(title: str, lines: list):
+    """콘솔이면 출력, 창 모드 exe(콘솔 없음)면 팝업으로 보여 준다."""
+    text = "\n".join(lines)
+    if not FROZEN and sys.stdout is not None:
+        print(text)
+        return
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showinfo(title, text, parent=r)
+        r.destroy()
+    except Exception:
+        pass
+
+
+def register_assoc() -> int:
+    """현재 사용자(HKCU)에만 등록하므로 관리자 권한이 필요 없다."""
+    out = []
+    import winreg as w
+    cmd = _open_command()
+    base = r"Software\Classes"
+
+    def setv(path, name, value):
+        with w.CreateKey(w.HKEY_CURRENT_USER, path) as k:
+            w.SetValueEx(k, name, 0, w.REG_SZ, value)
+
+    # 예전 이름으로 등록된 것이 있으면 정리하되, 그 전에 기억해 둔 원래 연결값은 이어받는다
+    legacy_prev = _remove_assoc(LEGACY_PROGIDS, restore=False)
+    for ext, v in legacy_prev.items():
+        setv(rf"{base}\{PROGID}", f"PrevDefault{ext}", v)
+    setv(rf"{base}\{PROGID}", "", "STEP 3D 모델 (STEP 뷰어)")
+    setv(rf"{base}\{PROGID}\shell", "", "open")
+    setv(rf"{base}\{PROGID}\shell\open", "", "STEP 뷰어로 열기")
+    setv(rf"{base}\{PROGID}\shell\open", "FriendlyAppName", "STEP 뷰어")
+    setv(rf"{base}\{PROGID}\shell\open\command", "", cmd)
+    user_choice = []
+    for ext in STEP_EXTS_REG:
+        try:  # 원래 연결돼 있던 값을 기억해 두었다가 해제할 때 되돌린다
+            with w.OpenKey(w.HKEY_CURRENT_USER, rf"{base}\{ext}") as k:
+                prev = w.QueryValueEx(k, "")[0]
+            if prev and prev != PROGID:
+                setv(rf"{base}\{PROGID}", f"PrevDefault{ext}", prev)
+        except OSError:
+            pass
+        setv(rf"{base}\{ext}", "", PROGID)                      # 기본 연결
+        setv(rf"{base}\{ext}\OpenWithProgids", PROGID, "")    # '연결 프로그램' 목록에 표시
+        # 오른쪽 클릭 메뉴 'STEP 뷰어로 열기' (기본 앱이 다른 프로그램이어도 항상 사용 가능)
+        setv(rf"{base}\SystemFileAssociations\{ext}\shell\{MENU_KEY}", "", "STEP 뷰어로 열기")
+        setv(rf"{base}\SystemFileAssociations\{ext}\shell\{MENU_KEY}\command", "", cmd)
+        try:
+            w.OpenKey(w.HKEY_CURRENT_USER,
+                      rf"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}\UserChoice").Close()
+            user_choice.append(ext)
+        except OSError:
+            pass
+    _notify_shell()
+    out.append("파일 연결 등록 완료")
+    out.append(f"  실행 명령: {cmd}")
+    out.append("  - .stp / .step 파일 오른쪽 클릭 → 'STEP 뷰어로 열기' 메뉴가 생겼습니다.")
+    out.append("    (윈도우 11은 오른쪽 클릭 → '더 많은 옵션 표시' 안에 있습니다)")
+    if user_choice:
+        out.append(f"\n  ※ {', '.join(user_choice)} 파일은 이미 다른 프로그램이 '항상 사용'으로 지정돼 있어 윈도우가 우선합니다.")
+        out.append("    더블클릭으로 열려면 한 번만 아래처럼 지정해 주세요.")
+        out.append("    STEP 파일 오른쪽 클릭 → 연결 프로그램 → 다른 앱 선택 → 'STEP 뷰어'(또는 pythonw / STEPViewer) 선택")
+        out.append("    → '항상 이 앱을 사용하여 열기' 체크 → 확인")
+    else:
+        out.append("  - 이제 STEP 파일을 더블클릭하면 바로 뷰어로 열립니다.")
+    _report("파일 연결 등록", out)
+    return 0
+
+
+def _remove_assoc(pids, restore=True) -> dict:
+    """pids(현재·예전 이름)로 만든 등록을 지우고, 등록 전 원래 연결값(prev)을 돌려준다.
+    restore=True 면 확장자 기본값을 원래 값으로 복구한다."""
+    import winreg as w
+    base = r"Software\Classes"
+
+    def deltree(path):
+        try:
+            with w.OpenKey(w.HKEY_CURRENT_USER, path, 0, w.KEY_ALL_ACCESS) as k:
+                while True:
+                    try:
+                        sub = w.EnumKey(k, 0)
+                    except OSError:
+                        break
+                    deltree(rf"{path}\{sub}")
+            w.DeleteKey(w.HKEY_CURRENT_USER, path)
+        except OSError:
+            pass
+
+    prev = {}
+    for pid in pids:
+        try:
+            with w.OpenKey(w.HKEY_CURRENT_USER, rf"{base}\{pid}") as k:
+                for ext in STEP_EXTS_REG:
+                    try:
+                        prev.setdefault(ext, w.QueryValueEx(k, f"PrevDefault{ext}")[0])
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        deltree(rf"{base}\{pid}")
+    for ext in STEP_EXTS_REG:
+        for mk in (MENU_KEY,) + LEGACY_MENU_KEYS:
+            deltree(rf"{base}\SystemFileAssociations\{ext}\shell\{mk}")
+        for pid in pids:
+            try:
+                with w.OpenKey(w.HKEY_CURRENT_USER, rf"{base}\{ext}\OpenWithProgids", 0, w.KEY_ALL_ACCESS) as k:
+                    w.DeleteValue(k, pid)
+            except OSError:
+                pass
+        try:
+            with w.OpenKey(w.HKEY_CURRENT_USER, rf"{base}\{ext}", 0, w.KEY_ALL_ACCESS) as k:
+                if w.QueryValueEx(k, "")[0] in pids:
+                    if restore and ext in prev:
+                        w.SetValueEx(k, "", 0, w.REG_SZ, prev[ext])  # 원래 값으로 복구
+                    else:
+                        w.DeleteValue(k, "")
+        except OSError:
+            pass
+    return prev
+
+
+def unregister_assoc() -> int:
+    out = []
+    _remove_assoc((PROGID,) + LEGACY_PROGIDS, restore=True)
+    _notify_shell()
+    out.append("파일 연결 해제 완료 (원래 프로그램으로 되돌아갑니다)")
+    _report("파일 연결 해제", out)
+    return 0
+
+
+def _notify_shell():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # 탐색기에 연결 변경 알림
+    except Exception:
+        pass
+
+
+def diag(path: Path | None):
+    """느린 파일의 원인 분석: 단계별 시간과 형상 구성을 출력한다. 사용: python step_viewer.py --diag [파일]"""
+    out = []
+    import time as _t
+    if path is None:  # 파일을 안 주면 step_history 안에서 가장 큰 STEP 을 고른다
+        cands = sorted(HIST_DIR.glob("*/model.stp"), key=lambda q: q.stat().st_size, reverse=True)
+        if not cands:
+            out.append("step_history 폴더에서 STEP 파일을 찾지 못했습니다. 파일 경로를 직접 적어 주세요.")
+            _report("STEP 진단", out)
+            return 1
+        path = cands[0]
+    raw = path.read_bytes()
+    out.append(f"진단 파일: {path}\n크기    : {len(raw) / 1e6:.1f} MB")
+    text = raw.decode("utf-8", errors="replace")
+    out.append(f"STEP 개체 수(대략): {text.count(chr(10))}줄, B_SPLINE_SURFACE {text.upper().count('B_SPLINE_SURFACE')}개, "
+          f"ADVANCED_FACE {text.upper().count('ADVANCED_FACE(')}개, MANIFOLD_SOLID_BREP {text.upper().count('MANIFOLD_SOLID_BREP')}개")
+    t = _t.perf_counter()
+    info = analyze_text(text, path.name, None)
+    total = _t.perf_counter() - t
+    d = info["timing_detail"]
+    out.append(f"\n[해석 {total:.1f}초] STEP 변환 {d['import']} / 치수 {d['bbox']} / 부피 {d['volume']} / 기타 {d['rest']}")
+    out.append(f"면 {info['faces']}개: {info['face_types']}")
+    t = _t.perf_counter()
+    mesh = build_mesh(info["_shape"], info.get("_meshp"))
+    out.append(f"[메시 {_t.perf_counter() - t:.1f}초] 삼각형 {mesh.n_cells}개")
+    out.append("\n이 출력 전체를 복사해서 알려 주세요.")
+    _report("STEP 진단", out)
+    return 0
+
+
+def selftest(render: bool = True) -> int:
+    """배포판 점검: 작은 테스트 형상으로 STEP 읽기 → 분석 → 메시 → 저장/불러오기 → 3D 창(잠깐 열었다 닫기) → PNG.
+    성공하면 0, 실패하면 1. 결과는 exe 옆 step_selftest.log 에 남는다."""
+    import time as _t
+    import traceback
+    log = APP_DIR / "step_selftest.log"
+    try:
+        import pyvista as pv
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+        from OCP.STEPControl import STEPControl_AsIs, STEPControl_Writer
+
+        box = BRepPrimAPI_MakeBox(20.0, 10.0, 5.0).Shape()
+        cyl = BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(10, 5, -1), gp_Dir(0, 0, 1)), 3.0, 7.0).Shape()
+        shape = BRepAlgoAPI_Cut(box, cyl).Shape()
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "t.stp"
+            w = STEPControl_Writer()
+            w.Transfer(shape, STEPControl_AsIs)
+            w.Write(str(f))
+            text = f.read_text(encoding="utf-8", errors="replace")
+            info = analyze_text(text, "selftest.stp", 7.85)
+            expect = 20 * 10 * 5 - 3.141592653589793 * 9 * 5
+            assert abs(info["volume_mm3"] - expect) < 0.5, f"부피 불일치 {info['volume_mm3']} != {expect:.2f}"
+            assert (info["size_x"], info["size_y"], info["size_z"]) == (20.0, 10.0, 5.0), "치수 불일치"
+            mesh = build_mesh(info.pop("_shape"), info.pop("_meshp"))
+            mesh.save(str(Path(d) / "m.vtp"))
+            info["_mesh"] = pv.read(str(Path(d) / "m.vtp"))
+            if not render:
+                # 화면(OpenGL)이 없는 빌드 서버용: 3D 엔진 모듈이 빠짐없이 들어 있는지만 확인
+                import vtkmodules.vtkInteractionStyle  # noqa: F401
+                import vtkmodules.vtkRenderingAnnotation  # noqa: F401
+                import vtkmodules.vtkRenderingFreeType  # noqa: F401
+                import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
+                pl = pv.Plotter(off_screen=True)
+                pl.add_mesh(info["_mesh"], color=DEFAULT_COLOR)
+                pl.add_mesh(info["_mesh"].extract_feature_edges(35), color="#222222")
+                pl.add_text(SHORTCUT_MEMO, position="lower_left", font_size=8)
+                pl.add_axes()
+                pl.add_bounding_box()
+                log.write_text("OK (no render)\n", encoding="utf-8")
+                return 0
+            show(info, png=str(Path(d) / "s.png"))
+            assert (Path(d) / "s.png").stat().st_size > 1000, "이미지 저장 실패"
+            # 대화형 창: 잠깐 열고 몇 번 그린 뒤 닫는다
+            pl = pv.Plotter(window_size=(400, 300), title="STEP viewer self test")
+            pl.add_mesh(info["_mesh"], color=DEFAULT_COLOR)
+            pl.add_text("self test", position="lower_left", font_size=8)
+            pl.show(interactive_update=True, auto_close=False)
+            for _ in range(10):
+                pl.camera.Azimuth(5)
+                pl.renderer.reset_camera_clipping_range()
+                pl.iren.process_events()
+                pl.render()
+                _t.sleep(0.03)
+            pl.close()
+        log.write_text("OK\n", encoding="utf-8")
+        return 0
+    except BaseException:
+        log.write_text("FAIL\n" + traceback.format_exc(), encoding="utf-8")
+        return 1
+
+
+def main():
+    if "--worker" in sys.argv:
+        return worker_main()
+    if "--selftest" in sys.argv:
+        return selftest(render="--no-render" not in sys.argv)
+    ap = argparse.ArgumentParser(description="STEP 뷰어 + 자동 정보 추출")
+    ap.add_argument("path", nargs="?", help="STEP 파일 또는 폴더 (없으면 클립보드 방식)")
+    ap.add_argument("--open", action="store_true", help="파일 선택 창으로 열기")
+    ap.add_argument("--clip", action="store_true", help="붙여넣기 창 대신 터미널에서 클립보드 방식으로 실행")
+    ap.add_argument("--info", action="store_true", help="창 없이 정보만 출력")
+    ap.add_argument("--png", help="창 없이 이미지로 저장")
+    ap.add_argument("--csv", help="폴더 일괄 처리 결과를 저장할 CSV 경로")
+    ap.add_argument("--color", help="모델 색상을 직접 지정. 예: \"#3366cc\" 또는 steelblue (없으면 파일의 색, 그것도 없으면 은회색)")
+    ap.add_argument("--gui-open", help="(파일 더블클릭용) 메인 창을 띄우고 이 파일을 바로 연다")
+    ap.add_argument("--register", action="store_true", help=".stp/.step 더블클릭 시 이 뷰어로 열리도록 등록")
+    ap.add_argument("--unregister", action="store_true", help="파일 연결 등록 해제")
+    ap.add_argument("--diag", action="store_true", help="느린 파일의 단계별 시간 분석 (경로 생략 시 step_history 안의 가장 큰 파일)")
+    ap.add_argument("--full-fix", action="store_true", help="STEP 형상 보정을 모두 수행(느림). 형상이 깨져 보일 때 사용")
+    ap.add_argument("--density", type=float, help="파일에 밀도가 없을 때 쓸 값(g/cm³). 예: 구리 8.94, 강 7.85")
+    a = ap.parse_args()
+
+    if a.register:
+        return register_assoc()
+    if a.unregister:
+        return unregister_assoc()
+    if a.gui_open:
+        return gui(a)
+    if a.diag:
+        return diag(Path(a.path) if a.path else None)
+    if not a.path and not a.open:
+        return clipboard_loop(a) if a.clip else gui(a)
+
+    path = Path(a.path) if a.path else pick_file()
+    if path is None:
+        print("파일이 선택되지 않았습니다.")
+        return 1
+    if path.is_dir():
+        batch(path, Path(a.csv or "step_summary.csv"), a.density)
+        return 0
+    print(f"여는 파일: {path}")
+    try:
+        info = analyze_file(path, a.density, a.full_fix)
+    except Exception as ex:
+        print(f"\n[열기 실패] {ex}")
+        return 1
+    print(format_info(info))
+    if a.info:
+        return 0
+    show(info, a.png, a.color)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
