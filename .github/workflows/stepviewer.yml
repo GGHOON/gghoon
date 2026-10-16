@@ -65,8 +65,8 @@ jobs:
         run: |
           function Run-Test {
             $p = Start-Process -FilePath dist/STEPViewer/STEPViewer.exe -ArgumentList "--selftest","--no-render" -Wait -PassThru
-            Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { "  $_" }
-            return $p.ExitCode
+            Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { Write-Host "  $_" }
+            return [int]$p.ExitCode
           }
           $code = Run-Test
           if ($code -ne 0) {
