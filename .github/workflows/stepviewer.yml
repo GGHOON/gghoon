@@ -45,6 +45,7 @@ jobs:
       - name: Build exe (PyInstaller)
         run: |
           python -m PyInstaller --noconfirm --clean --onedir --windowed --name STEPViewer `
+            --collect-all OCP `
             --hidden-import vtkmodules.vtkRenderingOpenGL2 --hidden-import vtkmodules.vtkInteractionStyle `
             --hidden-import vtkmodules.vtkRenderingFreeType --hidden-import vtkmodules.vtkRenderingAnnotation `
             --hidden-import vtkmodules.vtkIOXML --hidden-import vtkmodules.vtkIOGeometry `

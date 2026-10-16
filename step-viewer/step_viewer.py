@@ -1247,6 +1247,11 @@ def gui(a):
                        "(같은 모델은 다음부터 저장된 결과로 즉시 열립니다)")
             elif kind == "error":
                 set_out("[실패] 모델링 중 오류 (자세한 내용은 팝업 참고)")
+                if "No module named 'OCP" in msg or "No module named 'pyvista" in msg:
+                    msg = ("CAD/3D 엔진 라이브러리를 찾지 못했습니다.\n"
+                           "· exe 배포판이면: 묶을 때 라이브러리가 빠진 것입니다. GitHub 배포판을 받거나 "
+                           "step_viewer_exe만들기.bat 최신판으로 다시 만들어 주세요.\n"
+                           "· 파이썬으로 실행 중이면: pip install cadquery-ocp pyvista 로 설치해 주세요.\n\n" + msg)
                 show_error_box("모델링 실패", msg, root)
                 quit_if_single()
             else:
@@ -1629,6 +1634,43 @@ def diag(path: Path | None):
     return 0
 
 
+def _selftest_worker(text: str, d: Path):
+    """계산 프로세스(--worker)를 실제로 띄워 작업 하나를 끝까지 처리하는지 확인한다.
+    (메인 창은 CAD 엔진을 직접 쓰지 않으므로, 이 점검이 없으면 엔진 누락을 놓칠 수 있다)"""
+    import json
+    import subprocess
+    import time as _t
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model.stp").write_bytes(text.encode("utf-8"))
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    proc = subprocess.Popen(self_command() + ["--worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", creationflags=flags)
+    try:
+        proc.stdin.write(json.dumps({"id": 1, "dir": str(d), "name": "selftest.stp", "density": 7.85}) + "\n")
+        proc.stdin.flush()
+        t0 = _t.time()
+        for line in proc.stdout:
+            if not line.startswith("@@"):
+                continue
+            m = json.loads(line[2:])
+            if m.get("kind") == "warn":
+                raise AssertionError("계산 프로세스 준비 실패: " + m.get("msg", ""))
+            if m.get("kind") == "error":
+                raise AssertionError("계산 프로세스 오류:\n" + m.get("msg", ""))
+            if m.get("kind") == "done":
+                break
+            if _t.time() - t0 > 180:
+                raise AssertionError("계산 프로세스 응답 없음")
+        else:
+            raise AssertionError("계산 프로세스가 결과 없이 종료됨")
+        assert (d / "info.json").exists() and (d / "mesh.vtp").exists(), "계산 결과 파일 없음"
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def selftest(render: bool = True) -> int:
     """배포판 점검: 작은 테스트 형상으로 STEP 읽기 → 분석 → 메시 → 저장/불러오기 → 3D 창(잠깐 열었다 닫기) → PNG.
     성공하면 0, 실패하면 1. 결과는 exe 옆 step_selftest.log 에 남는다."""
@@ -1658,6 +1700,7 @@ def selftest(render: bool = True) -> int:
             mesh = build_mesh(info.pop("_shape"), info.pop("_meshp"))
             mesh.save(str(Path(d) / "m.vtp"))
             info["_mesh"] = pv.read(str(Path(d) / "m.vtp"))
+            _selftest_worker(text, Path(d) / "wk")
             if not render:
                 # 화면(OpenGL)이 없는 빌드 서버용: 3D 엔진 모듈이 빠짐없이 들어 있는지만 확인
                 import vtkmodules.vtkInteractionStyle  # noqa: F401
