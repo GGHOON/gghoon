@@ -110,6 +110,35 @@ jobs:
           Compress-Archive -Path dist/STEPViewer -DestinationPath STEPViewer-win64.zip -CompressionLevel Optimal
           "zip: {0:N0} MB" -f ((Get-Item STEPViewer-win64.zip).Length / 1MB)
 
+      - name: Build installer (setup.exe)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $kor = Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\Languages\Korean.isl"
+          $ver = "1.0.${{ github.run_number }}"
+          $isargs = @("/DAppVersion=$ver")
+          if ($kor) { $isargs += "/DUseKorean" }
+          & $iscc @isargs installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "setup: {0:N0} MB (korean UI: $kor)" -f ((Get-Item STEPViewer-Setup.exe).Length / 1MB)
+
+      - name: Test installer (silent install -> self test -> uninstall)
+        run: |
+          $dir = "$env:RUNNER_TEMP\stepviewer-install"
+          $p = Start-Process STEPViewer-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=assoc","/DIR=$dir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { "::error::installer exit $($p.ExitCode)"; exit 1 }
+          $t = Start-Process "$dir\STEPViewer.exe" -ArgumentList "--selftest","--no-render" -Wait -PassThru
+          $log = Get-Content "$dir\step_selftest.log"
+          $log | ForEach-Object { Write-Host "  $_" }
+          if (-not ($log[0] -like "OK*")) { $log | ForEach-Object { "::error::installed self test: $_" }; exit 1 }
+          $cmd = (Get-ItemProperty "HKCU:\Software\Classes\StepViewer.STEP.1\shell\open\command")."(default)"
+          "registered command: $cmd"
+          if (-not $cmd) { "::error::file association not registered"; exit 1 }
+          $u = Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES" -Wait -PassThru
+          Start-Sleep 3
+          if (Test-Path "HKCU:\Software\Classes\StepViewer.STEP.1") { "::error::association left after uninstall"; exit 1 }
+          "::notice::installer install/selftest/uninstall OK"
+
       - name: Publish release (stepviewer-latest)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -117,8 +146,8 @@ jobs:
           gh release delete stepviewer-latest -y --cleanup-tag 2>$null
           $render = "${{ steps.rendertest.outcome }}"
           $notes = "STEP 뷰어 윈도우 배포판 (파이썬 설치 불필요)`n`n" +
-                   "1. STEPViewer-win64.zip 을 받아 원하는 로컬 폴더에 압축을 풉니다.`n" +
-                   "2. STEPViewer 폴더의 STEPViewer.exe 를 실행합니다.`n" +
-                   "3. STEP 더블클릭으로 열려면 파일연결_등록.bat 을 한 번 실행합니다.`n`n" +
+                   "■ 설치 프로그램 (권장): STEPViewer-Setup.exe 실행 → 다음 → 설치. 관리자 권한 불필요, 현재 사용자에게만 설치.`n" +
+                   "  '.stp/.step 더블클릭으로 열기'를 체크하면 파일 연결까지 자동. 제거는 윈도우 '앱 및 기능'에서.`n`n" +
+                   "■ 압축본: STEPViewer-win64.zip 을 로컬 폴더에 풀고 STEPViewer.exe 실행 (파일연결_등록.bat 으로 연결).`n`n" +
                    "빌드 커밋: $env:GITHUB_SHA / 3D 창 자체 점검: $render"
-          gh release create stepviewer-latest STEPViewer-win64.zip --title "STEPViewer (Windows)" --notes $notes --target $env:GITHUB_SHA
+          gh release create stepviewer-latest STEPViewer-Setup.exe STEPViewer-win64.zip --title "STEPViewer (Windows)" --notes $notes --target $env:GITHUB_SHA

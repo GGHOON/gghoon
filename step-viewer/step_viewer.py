@@ -1465,6 +1465,8 @@ def _open_command() -> str:
 def _report(title: str, lines: list):
     """콘솔이면 출력, 창 모드 exe(콘솔 없음)면 팝업으로 보여 준다."""
     text = "\n".join(lines)
+    if "--quiet" in sys.argv:  # 설치 프로그램이 조용히 등록/해제할 때
+        return
     if not FROZEN and sys.stdout is not None:
         print(text)
         return
@@ -1752,6 +1754,7 @@ def main():
     ap.add_argument("--gui-open", help="(파일 더블클릭용) 메인 창을 띄우고 이 파일을 바로 연다")
     ap.add_argument("--register", action="store_true", help=".stp/.step 더블클릭 시 이 뷰어로 열리도록 등록")
     ap.add_argument("--unregister", action="store_true", help="파일 연결 등록 해제")
+    ap.add_argument("--quiet", action="store_true", help="등록/해제 결과 창을 띄우지 않음(설치 프로그램용)")
     ap.add_argument("--diag", action="store_true", help="느린 파일의 단계별 시간 분석 (경로 생략 시 step_history 안의 가장 큰 파일)")
     ap.add_argument("--full-fix", action="store_true", help="STEP 형상 보정을 모두 수행(느림). 형상이 깨져 보일 때 사용")
     ap.add_argument("--density", type=float, help="파일에 밀도가 없을 때 쓸 값(g/cm³). 예: 구리 8.94, 강 7.85")
