@@ -128,9 +128,9 @@ jobs:
           $p = Start-Process STEPViewer-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=assoc","/DIR=$dir" -Wait -PassThru
           if ($p.ExitCode -ne 0) { "::error::installer exit $($p.ExitCode)"; exit 1 }
           $t = Start-Process "$dir\STEPViewer.exe" -ArgumentList "--selftest","--no-render" -Wait -PassThru
-          $log = Get-Content "$dir\step_selftest.log"
+          $log = @(Get-Content "$dir\step_selftest.log")
           $log | ForEach-Object { Write-Host "  $_" }
-          if (-not ($log[0] -like "OK*")) { $log | ForEach-Object { "::error::installed self test: $_" }; exit 1 }
+          if (-not ([string]$log[0]).StartsWith("OK")) { $log | ForEach-Object { "::error::installed self test: $_" }; exit 1 }
           $cmd = (Get-ItemProperty "HKCU:\Software\Classes\StepViewer.STEP.1\shell\open\command")."(default)"
           "registered command: $cmd"
           if (-not $cmd) { "::error::file association not registered"; exit 1 }
