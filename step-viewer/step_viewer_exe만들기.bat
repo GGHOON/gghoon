@@ -34,8 +34,7 @@ echo [4/5] 자체 점검 중... (작은 3D 창이 잠깐 떴다 사라집니다)
 start "" /wait "%APP%\STEPViewer.exe" --selftest
 if errorlevel 1 (
   echo   점검 실패: 정리한 파일을 되돌리고 다시 점검합니다.
-  move /y "%APP%\_vtk_removed\*" "%APP%\_internal\vtkmodules\" >nul
-  rmdir "%APP%\_vtk_removed"
+  %PYCMD% prune_vtk.py %APP% --restore
   start "" /wait "%APP%\STEPViewer.exe" --selftest
   if errorlevel 1 goto :selftestfail
 ) else (

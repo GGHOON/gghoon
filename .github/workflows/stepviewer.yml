@@ -71,7 +71,7 @@ jobs:
           $code = Run-Test
           if ($code -ne 0) {
             "::warning::pruned build failed self test - restoring removed VTK files"
-            Move-Item dist/STEPViewer/_vtk_removed/* dist/STEPViewer/_internal/vtkmodules/ -Force
+            python prune_vtk.py dist/STEPViewer --restore
             $code = Run-Test
             if ($code -ne 0) {
               Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { "::error::$_" }
