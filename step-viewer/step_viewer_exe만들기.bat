@@ -10,14 +10,14 @@ rem --- 1) CAD 엔진(OCP)과 pyvista 가 '실제로' 설치된 파이썬을 고른다 (py 런처가
 set PYCMD=
 for %%P in (python py) do (
   if not defined PYCMD (
-    %%P -c "import OCP.STEPControl, pyvista" >nul 2>nul && set PYCMD=%%P
+    %%P -c "import OCP.STEPControl, pyvista, pyvistaqt" >nul 2>nul && set PYCMD=%%P
   )
 )
 if not defined PYCMD (
-  echo [오류] OCP^(cadquery-ocp^)와 pyvista 가 함께 설치된 파이썬을 찾지 못했습니다.
+  echo [오류] OCP^(cadquery-ocp^)·pyvista·pyvistaqt 가 함께 설치된 파이썬을 찾지 못했습니다.
   echo   설치된 파이썬 목록:
   py -0p 2>nul
-  echo   해결: 프로그램을 실행하던 파이썬에서  python -m pip install cadquery-ocp pyvista
+  echo   해결: 프로그램을 실행하던 파이썬에서  python -m pip install cadquery-ocp pyvista pyside6-essentials pyvistaqt qtpy
   pause
   exit /b 1
 )
@@ -36,6 +36,10 @@ echo [2/5] 묶는 중... (5~15분 걸릴 수 있습니다)
   --hidden-import vtkmodules.vtkIOXML --hidden-import vtkmodules.vtkIOGeometry ^
   --hidden-import vtkmodules.vtkFiltersCore --hidden-import vtkmodules.vtkFiltersGeneral ^
   --hidden-import vtkmodules.vtkFiltersSources --hidden-import vtkmodules.vtkRenderingUI ^
+  --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --hidden-import pyvistaqt --hidden-import qtpy ^
+  --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 ^
+  --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtNetwork ^
+  --exclude-module PySide6.QtPdf --exclude-module PySide6.QtSvg ^
   --exclude-module cadquery --exclude-module casadi --exclude-module nlopt --exclude-module ezdxf ^
   --exclude-module IPython --exclude-module trame --exclude-module PyQt5 --exclude-module PySide6 ^
   --exclude-module numba --exclude-module llvmlite --exclude-module cv2 --exclude-module imageio_ffmpeg ^

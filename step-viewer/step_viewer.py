@@ -1187,6 +1187,7 @@ def worker_main():
 
 
 LOG_PATH = APP_DIR / "step_viewer_error.log"
+_ERROR_DIALOG = None  # 한 창 인터페이스가 켜지면 Qt 오류 창 함수로 바뀜
 
 
 def show_error_box(title: str, msg: str, parent=None):
@@ -1197,6 +1198,12 @@ def show_error_box(title: str, msg: str, parent=None):
             f.write(f"\n[{_t.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n{msg}\n")
     except Exception:
         pass
+    if _ERROR_DIALOG is not None:  # 한 창(Qt) 인터페이스에서는 Qt 오류 창으로
+        try:
+            _ERROR_DIALOG(title, msg + f"\n\n(로그 파일: {LOG_PATH})")
+            return
+        except Exception:
+            pass
     try:
         from tkinter import messagebox
         messagebox.showerror(title, msg[-3000:] + f"\n\n(로그 파일: {LOG_PATH})", parent=parent)
@@ -1633,6 +1640,770 @@ def gui(a):
     return 0
 
 
+# ================================================================ 한 창 인터페이스 (Qt)
+# 위쪽 명령 도구 모음 · 왼쪽 부품 정보/이전 기록 패널 · 가운데 3D 화면 · 아래 상태 표시줄
+# (PySide6 + pyvistaqt 가 없으면 예전 두 창 방식(tkinter)으로 자동 대체)
+QT_STYLE = """
+QMainWindow, QWidget#panel { background: #f5f5f7; }
+QToolBar#command { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #ffffff, stop:1 #ececee);
+                   border: none; border-bottom: 1px solid #d2d2d7; spacing: 2px; padding: 4px 6px; }
+QToolBar#headsup { background: transparent; border: none; spacing: 1px; padding: 2px; }
+QToolButton { border: 1px solid transparent; border-radius: 6px; padding: 3px 6px; color: #1d1d1f; }
+QToolButton:hover { background: #e8e8ed; }
+QToolButton:checked { background: #d6e6ff; border-color: #a9c8f5; }
+QToolButton:disabled { color: #a1a1a6; }
+QTabWidget::pane { border: 1px solid #d2d2d7; border-radius: 8px; background: #ffffff; top: -1px; }
+QTabBar::tab { background: transparent; padding: 5px 12px; color: #6e6e73; border: none; }
+QTabBar::tab:selected { color: #1d1d1f; border-bottom: 2px solid #0a84ff; }
+QTreeWidget { border: none; background: #ffffff; alternate-background-color: #fafafc; }
+QTreeWidget::item { padding: 3px 2px; }
+QTreeWidget::item:selected { background: #d6e6ff; color: #1d1d1f; }
+QHeaderView::section { background: #f5f5f7; border: none; border-bottom: 1px solid #e5e5ea; padding: 4px; color: #6e6e73; }
+QPushButton { background: #ffffff; border: 1px solid #d2d2d7; border-radius: 6px; padding: 4px 10px; }
+QPushButton:hover { background: #f0f0f5; }
+QLineEdit, QComboBox { background: #ffffff; border: 1px solid #d2d2d7; border-radius: 6px; padding: 3px 6px; }
+QStatusBar { background: #f5f5f7; border-top: 1px solid #d2d2d7; color: #3a3a3c; }
+QFrame#viewframe { background: #ffffff; border: 1px solid #d2d2d7; border-radius: 8px; }
+QLabel#hint { color: #6e6e73; }
+"""
+
+
+def _qt_icon(kind: str):
+    """도구 모음 아이콘을 직접 그린다(외부 이미지 파일 없이). 뷰 방향은 등각 정육면체에 해당 면을 칠한 모양."""
+    from qtpy import QtCore, QtGui
+    S = 28
+    pm = QtGui.QPixmap(S, S)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    pen = QtGui.QPen(QtGui.QColor("#3a3a3c"), 1.4)
+    p.setPen(pen)
+    blue, light = QtGui.QColor("#4c8dff"), QtGui.QColor("#e4e9f2")
+    P = QtCore.QPointF
+    # 등각 정육면체 꼭짓점
+    top = [P(14, 3), P(25, 9), P(14, 15), P(3, 9)]
+    left = [P(3, 9), P(14, 15), P(14, 26), P(3, 20)]
+    right = [P(14, 15), P(25, 9), P(25, 20), P(14, 26)]
+
+    def poly(pts, fill):
+        p.setBrush(QtGui.QBrush(fill))
+        p.drawPolygon(QtGui.QPolygonF(pts))
+
+    if kind in ("iso", "front", "top", "right", "fit"):
+        poly(top, blue if kind in ("top", "iso") else light)
+        poly(left, blue if kind in ("front", "iso") else light)
+        poly(right, blue if kind in ("right", "iso") else light)
+        if kind == "fit":
+            p.setPen(QtGui.QPen(QtGui.QColor("#0a84ff"), 2))
+            for a, b in (((1, 1), (7, 1)), ((1, 1), (1, 7)), ((27, 27), (21, 27)), ((27, 27), (27, 21))):
+                p.drawLine(P(*a), P(*b))
+    elif kind in ("shaded_edges", "shaded", "wire"):
+        fill = QtGui.QColor("#9fb4cc") if kind != "wire" else QtCore.Qt.transparent
+        p.setPen(QtGui.QPen(QtGui.QColor("#1d1d1f" if kind != "shaded" else "#9fb4cc"), 1.4))
+        for face in (top, left, right):
+            poly(face, fill if not isinstance(fill, QtGui.QColor) else (fill.lighter(115) if face is top else fill))
+    elif kind.startswith("sec"):
+        poly(top, light); poly(left, light); poly(right, light)
+        p.setPen(QtGui.QPen(QtGui.QColor("#d0342c"), 2.2))
+        ax = kind[-1]
+        if ax == "x":
+            p.drawLine(P(8.5, 6), P(8.5, 23))
+        elif ax == "y":
+            p.drawLine(P(19.5, 6), P(19.5, 23))
+        else:
+            p.drawLine(P(3, 14.5), P(25, 14.5))
+        p.setPen(pen)
+        f = p.font(); f.setPointSize(7); f.setBold(True); p.setFont(f)
+        p.drawText(QtCore.QRectF(0, 0, S, S), QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom, ax.upper())
+    elif kind == "dims":
+        p.setPen(QtGui.QPen(QtGui.QColor("#1f4e79"), 1.6))
+        p.drawLine(P(4, 18), P(24, 18)); p.drawLine(P(4, 13), P(4, 23)); p.drawLine(P(24, 13), P(24, 23))
+        p.setBrush(QtGui.QColor("#1f4e79"))
+        p.drawPolygon(QtGui.QPolygonF([P(4, 18), P(8, 16), P(8, 20)]))
+        p.drawPolygon(QtGui.QPolygonF([P(24, 18), P(20, 16), P(20, 20)]))
+        f = p.font(); f.setPointSize(8); f.setBold(True); p.setFont(f)
+        p.drawText(QtCore.QRectF(0, 1, S, 12), QtCore.Qt.AlignCenter, "Ø")
+    elif kind == "box":
+        p.setPen(QtGui.QPen(QtGui.QColor("#6e6e73"), 1.3, QtCore.Qt.DashLine))
+        p.setBrush(QtCore.Qt.NoBrush)
+        for face in (top, left, right):
+            p.drawPolygon(QtGui.QPolygonF(face))
+    elif kind == "rotate":
+        p.setPen(QtGui.QPen(QtGui.QColor("#0a84ff"), 2.2))
+        p.drawArc(QtCore.QRectF(5, 5, 18, 18), 30 * 16, 290 * 16)
+        p.setBrush(QtGui.QColor("#0a84ff"))
+        p.drawPolygon(QtGui.QPolygonF([P(23, 9), P(18, 10), P(22, 15)]))
+    elif kind == "open":
+        p.setBrush(QtGui.QColor("#ffd479")); p.setPen(QtGui.QPen(QtGui.QColor("#b8860b"), 1.3))
+        p.drawRoundedRect(QtCore.QRectF(3, 8, 22, 15), 2, 2)
+        p.drawRoundedRect(QtCore.QRectF(3, 5, 9, 5), 1.5, 1.5)
+    elif kind == "panel":
+        p.setBrush(QtGui.QColor("#ffffff")); p.drawRoundedRect(QtCore.QRectF(3, 5, 22, 18), 3, 3)
+        p.setBrush(QtGui.QColor("#9fb4cc")); p.drawRect(QtCore.QRectF(3.7, 5.7, 7, 16.6))
+    elif kind == "color":
+        for i, c in enumerate(("#ff6b6b", "#ffd166", "#06d6a0", "#4c8dff")):
+            p.setBrush(QtGui.QColor(c)); p.setPen(QtCore.Qt.NoPen)
+            p.drawEllipse(QtCore.QRectF(4 + (i % 2) * 10, 4 + (i // 2) * 10, 10, 10))
+    elif kind == "fix":
+        p.setPen(QtGui.QPen(QtGui.QColor("#3a3a3c"), 2))
+        p.drawLine(P(7, 21), P(18, 10))
+        p.setBrush(QtGui.QColor("#ff9f0a")); p.drawEllipse(QtCore.QRectF(15, 4, 9, 9))
+    p.end()
+    return QtGui.QIcon(pm)
+
+
+class _QtClipboard:
+    """메모장 읽기 함수가 쓰는 tkinter 클립보드 함수들을 Qt 로 흉내 낸다."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def update(self):
+        self.app.processEvents()
+
+    def clipboard_get(self):
+        return self.app.clipboard().text()
+
+    def clipboard_clear(self):
+        self.app.clipboard().clear()
+
+    def clipboard_append(self, t):
+        self.app.clipboard().setText(t)
+
+
+class _Scene:
+    """3D 화면에 놓인 모델·모서리·치수·단면·외곽 상자를 관리한다."""
+
+    def __init__(self, pl):
+        self.pl = pl
+        self.info = None
+        self.mesh = None
+        self.body = self.edges = self.box = None
+        self.dim_names, self.clip_names = [], []
+        self.section = None
+        self.dims_on, self.box_on, self.style = True, False, "shaded_edges"
+        self.color = DEFAULT_COLOR
+
+    def _bg(self):
+        self.pl.set_background("#c5d0dd", top="#ffffff")  # 위는 흰색, 아래로 갈수록 연한 청회색
+
+    def load(self, info, color=None):
+        import pyvista as pv
+        pl = self.pl
+        self.section_off()
+        pl.clear()
+        try:  # clear() 가 조명까지 지워서 다시 켠다 (없으면 음영 없이 납작하게 보임)
+            pl.enable_lightkit()
+        except Exception:
+            pass
+        self._bg()
+        self.info = info
+        self.mesh = info["_mesh"] if info.get("_mesh") is not None else build_mesh(info["_shape"], info.get("_meshp"))
+        self.color = color or info.get("color") or DEFAULT_COLOR
+        self.body = pl.add_mesh(self.mesh, color=self.color, smooth_shading=False, specular=0.4,
+                                split_sharp_edges=True, name="body")
+        e = self.mesh.extract_feature_edges(feature_angle=35, boundary_edges=True, non_manifold_edges=False)
+        self.edges = pl.add_mesh(e, color="#222222", line_width=1, name="edges") if e.n_points else None
+        self.box = pl.add_mesh(pv.Box(bounds=self.mesh.bounds).outline(), color="#8e8e93", line_width=1,
+                               name="box_outline", pickable=False)
+        try:
+            self.dim_names = add_dimensions(pl, info)
+        except Exception:
+            self.dim_names = []
+        self.apply()
+        self.view("iso")
+
+    def apply(self):
+        if self.body is None:
+            return
+        self.body.GetProperty().SetRepresentationToWireframe() if self.style == "wire" \
+            else self.body.GetProperty().SetRepresentationToSurface()
+        if self.edges is not None:
+            self.edges.SetVisibility(self.style != "shaded" and self.section is None)
+        self.body.SetVisibility(self.section is None)
+        self.box.SetVisibility(self.box_on)
+        for nm, act in list(self.pl.renderer.actors.items()):
+            if any(str(nm) == d or str(nm).startswith(d + "-") for d in self.dim_names):
+                act.SetVisibility(self.dims_on)
+        self.pl.render()
+
+    def view(self, name):
+        if self.body is None:
+            return
+        pl = self.pl
+        {"iso": pl.view_isometric, "front": pl.view_xz, "top": pl.view_xy, "right": pl.view_yz}.get(
+            name, pl.view_isometric)()
+        if name == "fit":
+            pl.reset_camera()
+        pl.renderer.reset_camera_clipping_range()
+        pl.render()
+
+    def section_off(self):
+        try:
+            self.pl.clear_plane_widgets()
+        except Exception:
+            pass
+        for nm in self.clip_names:
+            try:
+                self.pl.remove_actor(nm)
+            except Exception:
+                pass
+        self.clip_names, self.section = [], None
+
+    def set_section(self, axis):
+        if self.body is None:
+            return
+        self.section_off()
+        if axis:
+            before = set(self.pl.renderer.actors.keys())
+            self.pl.add_mesh_clip_plane(self.mesh, normal=axis, crinkle=False, color=self.color,
+                                        smooth_shading=False, backface_params={"color": "#c0392b"},
+                                        widget_color="#0a84ff", outline_opacity=0.15)
+            self.clip_names = [k for k in self.pl.renderer.actors.keys() if k not in before]
+            self.section = axis
+        self.apply()
+
+    def set_color(self, c):
+        self.color = c
+        if self.body is not None:
+            self.body.GetProperty().SetColor(*[int(c[i:i + 2], 16) / 255 for i in (1, 3, 5)])
+            if self.section:
+                self.set_section(self.section)
+            self.pl.render()
+
+
+def _fill_info_tree(tree, info, note=""):
+    """솔리드웍스 FeatureManager 처럼 부품 정보를 나무 구조로 보여 준다."""
+    from qtpy import QtWidgets
+    tree.clear()
+    if not info:
+        return
+    root = QtWidgets.QTreeWidgetItem([info.get("part") or info.get("file") or "부품", ""])
+    f = root.font(0); f.setBold(True); root.setFont(0, f)
+    tree.addTopLevelItem(root)
+
+    def add(parent, k, v=""):
+        it = QtWidgets.QTreeWidgetItem([k, str(v)])
+        it.setToolTip(1, str(v))  # 칸이 좁아 잘린 값은 마우스를 올리면 전체가 보임
+        parent.addChild(it)
+        return it
+
+    add(root, "파일", info.get("file", ""))
+    add(root, "재질", info.get("material") or "-")
+    dens = info.get("density_g_cm3")
+    add(root, "밀도", f"{dens:g} g/cm³" if dens else "-")
+    size = add(root, "외형 치수", f"{_fmt_mm(info['size_x'])} × {_fmt_mm(info['size_y'])} × {_fmt_mm(info['size_z'])} mm")
+    for ax in "xyz":
+        add(size, ax.upper(), f"{_fmt_mm(info['size_' + ax])} mm")
+    add(root, "부피", f"{info['volume_mm3']:,} mm³")
+    add(root, "질량", f"{info['mass_g']} g" if info.get("mass_g") is not None else "밀도 정보 없음")
+    faces = add(root, "면", f"{info.get('faces', '')}개")
+    for k, v in (info.get("face_types") or {}).items():
+        add(faces, k, f"{v}")
+    holes = hole_groups(info, max_labels=50)
+    if holes:
+        hd = add(root, "구멍·축 지름", f"{len(holes)}종")
+        for d, cnt, _c, _n in holes:
+            add(hd, ("%d×" % cnt if cnt > 1 else "") + "Ø" + _fmt_mm(d), "")
+    add(root, "작성", info.get("software") or "-")
+    if note:
+        add(root, "비고", note)
+    tree.expandItem(root)
+    tree.expandItem(size)
+    tree.resizeColumnToContents(0)
+
+
+def _qt_env():
+    """Qt 바인딩을 PySide6 로 고정 (qtpy·VTK 가 다른 바인딩을 찾다가 실패하지 않게)."""
+    os.environ.setdefault("QT_API", "pyside6")
+    try:
+        import vtkmodules.qt
+        vtkmodules.qt.PyQtImpl = "PySide6"
+    except Exception:
+        pass
+
+
+def gui_qt(a):
+    """한 창 인터페이스. PySide6/pyvistaqt 가 없으면 ImportError 를 올려 예전 방식으로 대체된다."""
+    import json
+    import queue
+    import subprocess
+    import threading
+    import time as _time
+    import traceback
+
+    _qt_env()
+    from pyvistaqt import QtInteractor
+    from qtpy import QtCore, QtGui, QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setFont(QtGui.QFont("Malgun Gothic" if sys.platform == "win32" else app.font().family(), 9))
+    app.setStyleSheet(QT_STYLE)
+    single = bool(getattr(a, "gui_open", None))
+
+    win = QtWidgets.QMainWindow()
+    win.setWindowTitle("STEP 뷰어")
+    win.resize(1360, 860)
+
+    # ---- 오류 창을 Qt 로 띄우도록 연결
+    global _ERROR_DIALOG
+    _ERROR_DIALOG = lambda title, msg: QtWidgets.QMessageBox.critical(win, title, msg[-3000:])  # noqa: E731
+
+    # ---- 가운데 3D 화면 + 헤드업 보기 도구
+    center = QtWidgets.QFrame(); center.setObjectName("viewframe")
+    cl = QtWidgets.QVBoxLayout(center); cl.setContentsMargins(6, 4, 6, 6); cl.setSpacing(2)
+    headsup = QtWidgets.QToolBar(); headsup.setObjectName("headsup"); headsup.setIconSize(QtCore.QSize(22, 22))
+    hrow = QtWidgets.QHBoxLayout(); hrow.addStretch(1); hrow.addWidget(headsup); hrow.addStretch(1)
+    cl.addLayout(hrow)
+    pl = QtInteractor(center)
+    cl.addWidget(pl.interactor, 1)
+    pl.add_axes()
+    scene = _Scene(pl)
+    scene._bg()
+    # VTK 자체 키(q/e=창 닫기 등)를 끄고 모든 단축키는 Qt 에서 처리
+    try:
+        pl.iren.clear_key_event_callbacks()
+        pl.iren.interactor.RemoveObservers("CharEvent")
+    except Exception:
+        pass
+    win.setCentralWidget(center)
+
+    # ---- 왼쪽 패널: 부품 정보 / 이전 기록
+    panel = QtWidgets.QWidget(); panel.setObjectName("panel")
+    pv_l = QtWidgets.QVBoxLayout(panel); pv_l.setContentsMargins(8, 8, 4, 8)
+    tabs = QtWidgets.QTabWidget()
+    info_tree = QtWidgets.QTreeWidget(); info_tree.setHeaderLabels(["항목", "값"]); info_tree.setAlternatingRowColors(True)
+    hist_tree = QtWidgets.QTreeWidget(); hist_tree.setHeaderLabels(["열어본 시각", "파일명", "질량(g)"])
+    hist_tree.setRootIsDecorated(False); hist_tree.setAlternatingRowColors(True)
+    hist_box = QtWidgets.QWidget(); hb = QtWidgets.QVBoxLayout(hist_box); hb.setContentsMargins(0, 0, 0, 0)
+    hb.addWidget(hist_tree, 1)
+    hbtn = QtWidgets.QHBoxLayout()
+    b_hopen, b_hdel, b_hdir = QtWidgets.QPushButton("다시 열기"), QtWidgets.QPushButton("삭제"), QtWidgets.QPushButton("저장 폴더")
+    for b in (b_hopen, b_hdel, b_hdir):
+        hbtn.addWidget(b)
+    hb.addLayout(hbtn)
+    tabs.addTab(info_tree, "부품 정보")
+    tabs.addTab(hist_box, "이전 기록")
+    pv_l.addWidget(tabs, 1)
+    # 설정 영역
+    form = QtWidgets.QFormLayout(); form.setLabelAlignment(QtCore.Qt.AlignRight)
+    dens_edit = QtWidgets.QLineEdit("" if a.density is None else str(a.density))
+    dens_edit.setPlaceholderText("파일에 밀도가 없을 때만 사용 (예: 7.85)")
+    form.addRow("밀도 g/cm³", dens_edit)
+    hint = QtWidgets.QLabel("마우스: 왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동\n"
+                            "단축키: Space 자동회전 · V 정면 · T 윗면 · I 등각 · X 단면 · D 치수 · B 상자")
+    hint.setObjectName("hint"); hint.setWordWrap(True)
+    pv_l.addLayout(form)
+    pv_l.addWidget(hint)
+    dock = QtWidgets.QDockWidget("", win); dock.setObjectName("leftdock")
+    dock.setTitleBarWidget(QtWidgets.QWidget()); dock.setWidget(panel)
+    dock.setFeatures(QtWidgets.QDockWidget.NoDockWidgetFeatures)
+    panel.setMinimumWidth(300)
+    win.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
+
+    # ---- 상태 표시줄
+    status = win.statusBar()
+    prog = QtWidgets.QProgressBar(); prog.setRange(0, 0); prog.setMaximumWidth(160); prog.setVisible(False)
+    status.addPermanentWidget(prog)
+
+    def say(msg):
+        status.showMessage(msg)
+        app.processEvents()
+
+    # ---- 위쪽 명령 도구 모음 (솔리드웍스 CommandManager 처럼 아이콘 아래 글자)
+    cmd = QtWidgets.QToolBar("명령"); cmd.setObjectName("command"); cmd.setMovable(False)
+    cmd.setIconSize(QtCore.QSize(28, 28)); cmd.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+    win.addToolBar(QtCore.Qt.TopToolBarArea, cmd)
+
+    def act(bar, icon, text, slot=None, checkable=False, tip="", shortcut=None):
+        ac = QtWidgets.QAction(_qt_icon(icon), text, win)
+        ac.setCheckable(checkable)
+        ac.setToolTip(tip or text)
+        if slot:
+            ac.triggered.connect(slot)
+        if shortcut:
+            for sc in (shortcut if isinstance(shortcut, (list, tuple)) else [shortcut]):
+                s = QtWidgets.QShortcut(QtGui.QKeySequence(sc), win)
+                s.setContext(QtCore.Qt.ApplicationShortcut)
+                s.activated.connect(ac.trigger)
+        bar.addAction(ac)
+        return ac
+
+    ac_open = act(cmd, "open", "열기", tip="STEP 파일 선택 → 자동 모델링 (Ctrl+O)", shortcut="Ctrl+O")
+    ac_panel = act(cmd, "panel", "패널", checkable=True, tip="왼쪽 정보 패널 보이기/숨기기 (F9)", shortcut="F9")
+    ac_panel.setChecked(True)
+    ac_panel.toggled.connect(dock.setVisible)
+    cmd.addSeparator()
+    ac_color = act(cmd, "color", "색상", tip="모델 색상 바꾸기")
+    ac_fix = act(cmd, "fix", "정밀 보정", checkable=True,
+                 tip="형상이 깨져 보일 때만 켜기: STEP 형상 보정을 모두 수행(느림), 저장된 결과 무시")
+    ac_fix.setChecked(bool(getattr(a, "full_fix", False)))
+
+    # 헤드업 보기 도구
+    ac_fit = act(headsup, "fit", "", lambda: scene.view("fit"), tip="화면에 맞춤 (F)", shortcut="F")
+    ac_iso = act(headsup, "iso", "", lambda: scene.view("iso"), tip="등각 보기 (I)", shortcut="I")
+    act(headsup, "front", "", lambda: scene.view("front"), tip="정면 보기 (V)", shortcut="V")
+    act(headsup, "top", "", lambda: scene.view("top"), tip="윗면 보기 (T)", shortcut="T")
+    act(headsup, "right", "", lambda: scene.view("right"), tip="우측면 보기 (R)", shortcut="R")
+    headsup.addSeparator()
+    style_grp = QtWidgets.QActionGroup(win); style_grp.setExclusive(True)
+
+    def set_style(s):
+        scene.style = s
+        scene.apply()
+
+    for key, tip, sc in (("shaded_edges", "음영 + 모서리 표시", None), ("shaded", "음영", "S"), ("wire", "와이어프레임", "W")):
+        ac = act(headsup, key, "", lambda _=False, k=key: set_style(k), checkable=True, tip=tip + (f" ({sc})" if sc else ""),
+                 shortcut=sc)
+        style_grp.addAction(ac)
+        ac.setChecked(key == "shaded_edges")
+    headsup.addSeparator()
+    sec_acts = {}
+
+    def set_section(ax):
+        new = None if scene.section == ax else ax
+        scene.set_section(new)
+        for k, ac in sec_acts.items():
+            ac.setChecked(k == new)
+        refresh_status()
+
+    for ax in "xyz":
+        sec_acts[ax] = act(headsup, "sec" + ax, "", lambda _=False, k=ax: set_section(k), checkable=True,
+                           tip=f"{ax.upper()} 단면 보기 (다시 누르면 끔, 파란 평면을 끌어 위치 이동)")
+    QtWidgets.QShortcut(QtGui.QKeySequence("X"), win, activated=lambda: set_section(
+        {None: "x", "x": "y", "y": "z", "z": None}[scene.section] or scene.section)).setContext(QtCore.Qt.ApplicationShortcut)
+    headsup.addSeparator()
+
+    def toggle_dims(on):
+        scene.dims_on = on
+        scene.apply()
+
+    def toggle_box(on):
+        scene.box_on = on
+        scene.apply()
+
+    ac_dims = act(headsup, "dims", "", checkable=True, tip="도면식 치수 표기 (D)", shortcut="D")
+    ac_dims.setChecked(True); ac_dims.toggled.connect(toggle_dims)
+    ac_box = act(headsup, "box", "", checkable=True, tip="외곽 상자 (B)", shortcut="B")
+    ac_box.toggled.connect(toggle_box)
+
+    # 자동 회전
+    rot = {"speed": 1.0}
+    rot_timer = QtCore.QTimer(win); rot_timer.setInterval(30)
+
+    def rot_tick():
+        if scene.body is not None:
+            pl.camera.Azimuth(rot["speed"])
+            pl.renderer.reset_camera_clipping_range()
+            pl.render()
+
+    rot_timer.timeout.connect(rot_tick)
+    ac_rot = act(headsup, "rotate", "", checkable=True, tip="자동 회전 (Space / A, ↑↓ 속도)", shortcut=["Space", "A"])
+    ac_rot.toggled.connect(lambda on: (rot_timer.start() if on else rot_timer.stop(), refresh_status()))
+
+    def speed(dlt):
+        rot["speed"] = min(8.0, max(0.2, rot["speed"] + dlt))
+        refresh_status()
+
+    for sc, dl in (("Up", 0.5), ("Down", -0.5)):
+        QtWidgets.QShortcut(QtGui.QKeySequence(sc), win, activated=lambda d=dl: speed(d)).setContext(
+            QtCore.Qt.ApplicationShortcut)
+
+    def refresh_status():
+        parts = []
+        if ac_rot.isChecked():
+            parts.append(f"자동 회전 {rot['speed']:.1f}")
+        if scene.section:
+            parts.append(f"{scene.section.upper()} 단면")
+        if parts:
+            say("  ·  ".join(parts))
+
+    def pick_color():
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(scene.color), win, "모델 색상")
+        if c.isValid():
+            scene.set_color(c.name())
+            state["color"] = c.name()
+
+    ac_color.triggered.connect(pick_color)
+    state = {"color": a.color}
+
+    # ---- 계산 작업 프로세스 (tk 판과 같은 방식)
+    wk = {"proc": None, "q": queue.Queue(), "ready": False, "busy": False, "jid": 0}
+
+    def start_worker():
+        try:
+            HIST_DIR.mkdir(exist_ok=True)
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            logf = open(LOG_PATH.with_name("step_worker.log"), "a", encoding="utf-8")
+            proc = subprocess.Popen(self_command() + ["--worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=logf, text=True, encoding="utf-8", bufsize=1, creationflags=flags)
+        except Exception:
+            wk["proc"] = None
+            return
+        wk["proc"], wk["ready"] = proc, False
+
+        def reader():
+            for line in proc.stdout:
+                if line.startswith("@@"):
+                    try:
+                        wk["q"].put(json.loads(line[2:]))
+                    except Exception:
+                        pass
+            wk["q"].put({"kind": "exit"})
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def density():
+        t = dens_edit.text().strip()
+        if not t:
+            return None
+        return float(t)
+
+    def set_busy(on, msg=""):
+        wk["busy"] = on
+        prog.setVisible(on)
+        for ac in (ac_open,):
+            ac.setEnabled(not on)
+        hist_tree.setEnabled(not on)
+        if msg:
+            say(msg)
+
+    loading = {"dlg": None}
+
+    def show_loading(name):
+        dlg = QtWidgets.QDialog(win, QtCore.Qt.Dialog | QtCore.Qt.FramelessWindowHint)
+        dlg.setModal(True)
+        dlg.setStyleSheet("QDialog { background: #ffffff; border: 1px solid #d2d2d7; border-radius: 12px; }")
+        v = QtWidgets.QVBoxLayout(dlg); v.setContentsMargins(26, 20, 26, 20)
+        t = QtWidgets.QLabel("계산 중입니다..."); f = t.font(); f.setPointSize(12); f.setBold(True); t.setFont(f)
+        t.setAlignment(QtCore.Qt.AlignCenter)
+        stage = QtWidgets.QLabel(""); stage.setAlignment(QtCore.Qt.AlignCenter)
+        nm = QtWidgets.QLabel(name); nm.setObjectName("hint"); nm.setAlignment(QtCore.Qt.AlignCenter)
+        bar = QtWidgets.QProgressBar(); bar.setRange(0, 0); bar.setTextVisible(False); bar.setFixedWidth(320)
+        for w_ in (t, stage, nm, bar):
+            v.addWidget(w_)
+        dlg.stage = stage
+        dlg.show()
+        loading["dlg"] = dlg
+        return dlg
+
+    def hide_loading():
+        if loading["dlg"] is not None:
+            loading["dlg"].close()
+            loading["dlg"] = None
+
+    def finish(info, text, name, from_history, note):
+        if not from_history:
+            try:
+                history_add(text, info, name)
+                refresh_hist()
+            except Exception as ex:
+                say(f"기록 저장 실패: {ex}")
+        scene.load(info, state["color"])
+        for k, ac in sec_acts.items():
+            ac.setChecked(False)
+        ac_dims.setChecked(True); ac_box.setChecked(False)
+        scene.dims_on, scene.box_on = True, False
+        scene.apply()
+        _fill_info_tree(info_tree, info, note)
+        tabs.setCurrentIndex(0)
+        win.setWindowTitle(f"STEP 뷰어 — {name}")
+        say(note or "완료")
+
+    def fail(title, msg):
+        hide_loading()
+        set_busy(False, "[실패] " + title)
+        show_error_box(title, msg, win)
+
+    def run(text, name="pasted", from_history=False):
+        if wk["busy"]:
+            return
+        try:
+            dens = density()
+        except ValueError:
+            QtWidgets.QMessageBox.warning(win, "밀도", "밀도는 숫자로 입력해 주세요. 예: 8.94")
+            return
+        d = model_dir(text)
+        if not ac_fix.isChecked() and (d / "info.json").exists() and (d / "mesh.vtp").exists():
+            info = load_cached(d, name, dens)
+            if info is not None:
+                finish(info, text, name, from_history, "저장된 결과를 불러와 바로 열었습니다 (계산 생략)")
+                return
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "model.stp").write_bytes(text.encode("utf-8", errors="replace"))
+        if wk["proc"] is None or wk["proc"].poll() is not None:
+            start_worker()
+        proc = wk["proc"]
+        if proc is None:  # 작업 프로세스를 못 띄우면 이 창에서 직접 계산
+            set_busy(True, "계산 중... (창이 잠시 멈출 수 있습니다)")
+            try:
+                info = analyze_text(text, name, dens, ac_fix.isChecked())
+            except Exception:
+                fail("모델링 실패", traceback.format_exc())
+                return
+            set_busy(False)
+            finish(info, text, name, from_history, "")
+            return
+        wk["jid"] += 1
+        jid = wk["jid"]
+        try:
+            proc.stdin.write(json.dumps({"id": jid, "dir": str(d), "name": name, "density": dens,
+                                         "full_fix": ac_fix.isChecked()}, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except Exception:
+            wk["proc"] = None
+            say("[실패] 계산 프로세스에 연결하지 못했습니다. 다시 시도해 주세요.")
+            return
+        set_busy(True, f"{name} 계산 중...")
+        dlg = show_loading(name)
+        t0 = _time.perf_counter()
+        stg = {"msg": "계산 프로세스 준비 중 (처음 한 번만 몇 초 걸림)" if not wk["ready"] else "대기 중"}
+        timer = QtCore.QTimer(win)
+
+        def end(kind, msg=""):
+            timer.stop()
+            hide_loading()
+            set_busy(False)
+            if kind == "done":
+                info = load_cached(d, name, dens)
+                if info is None:
+                    fail("결과 읽기 실패", str(d))
+                    return
+                tm = info.get("timing") or {}
+                finish(info, text, name, from_history,
+                       f"소요 {tm.get('parse', '?')}+{tm.get('mesh', '?')}초 (해석+메시, "
+                       f"{'정밀' if info.get('fix_mode') == 'full' else '빠른'} 보정) · 다음부터 즉시 열림")
+            elif kind == "error":
+                if "No module named 'OCP" in msg or "No module named 'pyvista" in msg:
+                    msg = "CAD/3D 엔진 라이브러리를 찾지 못했습니다. 배포판을 다시 설치해 주세요.\n\n" + msg
+                fail("모델링 실패", msg)
+            else:
+                wk["proc"] = None
+                fail("계산 프로세스 종료", f"자세한 기록: {LOG_PATH.with_name('step_worker.log')}")
+
+        def poll():
+            while True:
+                try:
+                    m = wk["q"].get_nowait()
+                except queue.Empty:
+                    break
+                k = m.get("kind")
+                if k == "ready":
+                    wk["ready"] = True
+                elif k == "stage" and m.get("job") == jid:
+                    stg["msg"] = m["msg"]
+                elif k == "done" and m.get("job") == jid:
+                    return end("done")
+                elif k == "error" and m.get("job") == jid:
+                    return end("error", m.get("msg", ""))
+                elif k == "exit":
+                    return end("exit")
+            if loading["dlg"] is not None:
+                loading["dlg"].stage.setText(f"{stg['msg']}  ({_time.perf_counter() - t0:.0f}초)")
+
+        timer.timeout.connect(poll)
+        timer.start(150)
+
+    def read_step_file(p: Path) -> str:
+        try:
+            text = p.read_bytes().decode("utf-8", errors="replace")
+            if text.lstrip("﻿ \t\r\n").upper().startswith("ISO-10303-21"):
+                return text
+        except OSError:
+            pass
+        return grab_text_via_notepad(p, _QtClipboard(app), say)
+
+    def open_path(p: Path):
+        if wk["busy"]:
+            return
+        try:
+            text = read_step_file(p)
+        except Exception:
+            win.raise_(); win.activateWindow()
+            fail("파일 가져오기 실패", traceback.format_exc())
+            return
+        win.raise_(); win.activateWindow()
+        run(text, p.name)
+
+    def choose_file():
+        if wk["busy"]:
+            return
+        fn, _ = QtWidgets.QFileDialog.getOpenFileName(win, "STEP 파일 선택", "", "STEP (*.stp *.step);;모든 파일 (*.*)")
+        if fn:
+            open_path(Path(fn))
+
+    ac_open.triggered.connect(choose_file)
+
+    # ---- 이전 기록
+    hist_items = []
+
+    def refresh_hist():
+        hist_items.clear(); hist_items.extend(history_load())
+        hist_tree.clear()
+        for e in hist_items:
+            it = QtWidgets.QTreeWidgetItem([e["saved_at"], e["name"], "-" if e.get("mass_g") is None else str(e["mass_g"])])
+            it.setToolTip(1, f"{e['size_x']} × {e['size_y']} × {e['size_z']} mm")
+            hist_tree.addTopLevelItem(it)
+        for i in range(3):
+            hist_tree.resizeColumnToContents(i)
+
+    def sel_entry():
+        it = hist_tree.currentItem()
+        return hist_items[hist_tree.indexOfTopLevelItem(it)] if it else None
+
+    def hist_open(*_):
+        e = sel_entry()
+        if not e:
+            return
+        try:
+            text = history_text(e)
+        except Exception as ex:
+            show_error_box("저장된 파일을 읽지 못했습니다", f"{e['stp']}\n{ex}", win)
+            return
+        run(text, e["name"], from_history=True)
+
+    def hist_del():
+        e = sel_entry()
+        if e and QtWidgets.QMessageBox.question(win, "기록 삭제", f"'{e['name']}' 기록을 삭제할까요?\n(저장된 STEP 사본도 함께 지워집니다)") \
+                == QtWidgets.QMessageBox.Yes:
+            history_delete(e["sha1"])
+            refresh_hist()
+
+    def hist_dir():
+        HIST_DIR.mkdir(exist_ok=True)
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(HIST_DIR)))
+
+    hist_tree.itemDoubleClicked.connect(hist_open)
+    b_hopen.clicked.connect(hist_open); b_hdel.clicked.connect(hist_del); b_hdir.clicked.connect(hist_dir)
+    refresh_hist()
+
+    # ---- 시작 / 종료
+    def on_close(ev):
+        rot_timer.stop()
+        try:
+            if wk["proc"] is not None:
+                wk["proc"].kill()
+        except Exception:
+            pass
+        try:
+            pl.close()
+        except Exception:
+            pass
+        ev.accept()
+
+    win.closeEvent = on_close
+    _fill_info_tree(info_tree, None)
+    say("[열기] 또는 Ctrl+O 로 STEP 파일을 고르세요. STEP 파일을 더블클릭해도 열립니다.")
+    win.show()
+    start_worker()
+    if single:
+        QtCore.QTimer.singleShot(300, lambda: open_path(Path(a.gui_open)))
+    if getattr(a, "_qt_test", None):  # 자체 점검용: 창을 띄운 뒤 콜백 실행
+        QtCore.QTimer.singleShot(200, lambda: a._qt_test(win, scene, run, app))
+    return app.exec() if hasattr(app, "exec") else app.exec_()
+
+
 def clipboard_loop(a):
     print("메모장에서 STEP 파일을 열고 Ctrl+A → Ctrl+C 로 전체 복사한 뒤 Enter 를 누르세요. (종료: q)")
     while True:
@@ -1883,6 +2654,35 @@ def _selftest_worker(text: str, d: Path):
             pass
 
 
+def _selftest_qt(info: dict):
+    """한 창 인터페이스를 실제로 띄워 모델을 올리고 단면·치수를 한 번씩 켜 본 뒤 닫는다."""
+    try:
+        _qt_env()
+        from pyvistaqt import QtInteractor
+        from qtpy import QtCore, QtWidgets
+    except ImportError:
+        return  # Qt 가 없는 설치(파이썬 직접 실행)는 예전 방식으로 동작하므로 건너뜀
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    w = QtWidgets.QMainWindow()
+    pl = QtInteractor(w)
+    w.setCentralWidget(pl.interactor)
+    w.resize(500, 400)
+    w.show()
+    sc = _Scene(pl)
+    sc.load(info)
+    sc.set_section("x")
+    sc.set_section(None)
+    sc.dims_on = False
+    sc.apply()
+    for _ in range(5):
+        app.processEvents()
+        pl.render()
+    assert sc.body is not None and not sc.clip_names, "Qt 화면 점검 실패"
+    pl.close()
+    w.close()
+    app.processEvents()
+
+
 def selftest(render: bool = True) -> int:
     """배포판 점검: 작은 테스트 형상으로 STEP 읽기 → 분석 → 메시 → 저장/불러오기 → 3D 창(잠깐 열었다 닫기) → PNG.
     성공하면 0, 실패하면 1. 결과는 exe 옆 step_selftest.log 에 남는다."""
@@ -1928,6 +2728,11 @@ def selftest(render: bool = True) -> int:
                 # 단면·측정·치수 눈금 기능이 쓰는 모듈
                 import vtkmodules.vtkInteractionWidgets  # noqa: F401
                 assert add_dimensions(pl, info), "치수 표기 실패"
+                # 한 창 인터페이스(Qt) 구성 요소가 들어 있는지
+                _qt_env()
+                import pyvistaqt  # noqa: F401
+                from qtpy import QtWidgets  # noqa: F401
+                import vtkmodules.qt.QVTKRenderWindowInteractor  # noqa: F401
                 log.write_text("OK (no render)\n", encoding="utf-8")
                 return 0
             show(info, png=str(Path(d) / "s.png"))
@@ -1940,6 +2745,7 @@ def selftest(render: bool = True) -> int:
             # 단면·측정·치수 눈금 기능도 실제 창에서 한 번씩 켜 본다
             pl.add_mesh_clip_plane(info["_mesh"], normal="x", crinkle=False)
             add_dimensions(pl, info)
+            _selftest_qt(info)
             for _ in range(10):
                 pl.camera.Azimuth(5)
                 pl.renderer.reset_camera_clipping_range()
@@ -1952,6 +2758,20 @@ def selftest(render: bool = True) -> int:
     except BaseException:
         log.write_text("FAIL\n" + traceback.format_exc(), encoding="utf-8")
         return 1
+
+
+def run_gui(a):
+    """한 창(Qt) 인터페이스를 우선 쓰고, PySide6/pyvistaqt 가 없으면 예전 두 창 방식으로."""
+    if not getattr(a, "classic", False):
+        try:
+            _qt_env()
+            import pyvistaqt  # noqa: F401
+            import qtpy  # noqa: F401
+        except Exception:
+            pass
+        else:
+            return gui_qt(a)
+    return gui(a)
 
 
 def main():
@@ -1970,6 +2790,7 @@ def main():
     ap.add_argument("--gui-open", help="(파일 더블클릭용) 메인 창을 띄우고 이 파일을 바로 연다")
     ap.add_argument("--register", action="store_true", help=".stp/.step 더블클릭 시 이 뷰어로 열리도록 등록")
     ap.add_argument("--unregister", action="store_true", help="파일 연결 등록 해제")
+    ap.add_argument("--classic", action="store_true", help="예전 두 창 방식(tkinter) 인터페이스로 실행")
     ap.add_argument("--quiet", action="store_true", help="등록/해제 결과 창을 띄우지 않음(설치 프로그램용)")
     ap.add_argument("--diag", action="store_true", help="느린 파일의 단계별 시간 분석 (경로 생략 시 step_history 안의 가장 큰 파일)")
     ap.add_argument("--full-fix", action="store_true", help="STEP 형상 보정을 모두 수행(느림). 형상이 깨져 보일 때 사용")
@@ -1981,11 +2802,11 @@ def main():
     if a.unregister:
         return unregister_assoc()
     if a.gui_open:
-        return gui(a)
+        return run_gui(a)
     if a.diag:
         return diag(Path(a.path) if a.path else None)
     if not a.path and not a.open:
-        return clipboard_loop(a) if a.clip else gui(a)
+        return clipboard_loop(a) if a.clip else run_gui(a)
 
     path = Path(a.path) if a.path else pick_file()
     if path is None:

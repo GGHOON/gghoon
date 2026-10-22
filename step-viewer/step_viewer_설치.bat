@@ -26,7 +26,7 @@ echo   사용할 파이썬: %PYCMD%
 
 echo [2/3] 라이브러리 설치 중... (처음 한 번, 수 분 걸릴 수 있습니다)
 %PYCMD% -m pip install --upgrade pip
-%PYCMD% -m pip install --user "cadquery-ocp==7.9.3.1.1" "pyvista==0.49.1" "vtk==9.6.2"
+%PYCMD% -m pip install --user "cadquery-ocp==7.9.3.1.1" "pyvista==0.49.1" "vtk==9.6.2" "pyside6-essentials==6.12.0" "pyvistaqt==0.13.1" "qtpy==2.4.3"
 if errorlevel 1 goto :pipfail
 
 echo [3/3] 설치 확인 중...
