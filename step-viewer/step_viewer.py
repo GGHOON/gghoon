@@ -26,6 +26,7 @@ STEP 파일 더블클릭으로 열기(한 번만 등록)
 
 3D 창 조작: 왼쪽 드래그=회전, 휠=확대, Shift+드래그(또는 가운데 버튼)=이동
             Space/A: 자동 회전 켜기·끄기 / ↑↓: 회전 속도 / v: 정면 / t: 상면 / i: 등각
+            x: 단면 보기(X→Y→Z→끔, 평면은 마우스로 이동) / d: 거리 측정(표면 두 점 클릭) / g: 치수 눈금
             w: 와이어프레임 / s: 솔리드 / b: 바깥 사각 틀 켜기·끄기(기본 꺼짐) / q: 종료 (창 아래쪽에 단축키 안내가 표시됨)
 """
 from __future__ import annotations
@@ -436,7 +437,8 @@ DEFAULT_COLOR = "#b0b7bd"  # 파일에 색이 없을 때 쓰는 은회색
 SHORTCUT_MEMO = (
     "Mouse: L-drag = rotate,  Wheel = zoom,  Shift+L-drag or M-drag = pan\n"
     "Keys : Space or A = auto-rotate,  Up/Down = rotate speed,  Q = quit\n"
-    "View : V = front,  T = top,  I = iso,  W = wireframe,  S = solid,  B = box on/off"
+    "View : V = front,  T = top,  I = iso,  W = wireframe,  S = solid,  B = box on/off\n"
+    "Tools: X = section (X/Y/Z/off, drag plane),  D = measure (click 2 points),  G = dimension ruler"
 )
 
 
@@ -446,12 +448,11 @@ def show(info: dict, png: str | None = None, color: str | None = None):
 
     mesh = info["_mesh"] if info.get("_mesh") is not None else build_mesh(info["_shape"], info.get("_meshp"))
     pl = pv.Plotter(off_screen=bool(png), window_size=(1100, 780), title="STEP viewer")
-    pl.add_mesh(mesh, color=color or info.get("color") or DEFAULT_COLOR,
-                smooth_shading=False, specular=0.4, split_sharp_edges=True)
+    model_color = color or info.get("color") or DEFAULT_COLOR
+    body = pl.add_mesh(mesh, color=model_color, smooth_shading=False, specular=0.4, split_sharp_edges=True)
     # 면마다 따로 쪼개져 있으므로 면의 경계선이 곧 실제 모서리입니다.
     edges = mesh.extract_feature_edges(feature_angle=35, boundary_edges=True, non_manifold_edges=False)
-    if edges.n_points:
-        pl.add_mesh(edges, color="#222222", line_width=1)
+    edge_actor = pl.add_mesh(edges, color="#222222", line_width=1) if edges.n_points else None
     pl.add_axes()
     pl.set_background("#eef0ee")
     pl.add_text(format_overlay(info), position="upper_left", font_size=9, color="#1d2421")
@@ -467,14 +468,120 @@ def show(info: dict, png: str | None = None, color: str | None = None):
         pl.show(screenshot=png, auto_close=True)
         return
 
+    # pyvista 기본 단축키(V=등각, B=선택, ↑↓=확대 등)가 우리 단축키와 겹쳐 두 동작이 동시에 일어나므로
+    # 기본 단축키를 지우고 필요한 것만 다시 등록한다. (W/S 등 VTK 자체 키는 그대로 동작)
+    try:
+        pl.iren.clear_key_event_callbacks()
+        if hasattr(pl, "_prep_for_close"):
+            pl.add_key_event("q", pl._prep_for_close)
+    except Exception:
+        pass
+
     # ---- 자동 회전: Space(또는 A)로 켜고 끔, 위/아래 화살표로 속도 조절
     # (+/- 는 VTK 기본 기능(선 굵기)과 겹쳐서 쓰지 않는다)
     state = {"on": False, "speed": 1.0}   # speed: 프레임당 회전 각도(도)
+    tools = {"section": None, "clip_names": [], "measure": False, "pts": [], "ruler": False, "box": False}
 
     def draw_status():
-        txt = (f"AUTO-ROTATE: ON  (speed {state['speed']:.1f})" if state["on"]
-               else "AUTO-ROTATE: OFF  (Space)")
-        pl.add_text(txt, position="lower_right", font_size=9, color="#1d2421", name="rot")
+        parts = [f"AUTO-ROTATE: ON ({state['speed']:.1f})" if state["on"] else "AUTO-ROTATE: OFF (Space)"]
+        if tools["section"]:
+            parts.append(f"SECTION: {tools['section'].upper()}")
+        if tools["measure"]:
+            parts.append("MEASURE: click 2 points")
+        if tools["ruler"]:
+            parts.append("RULER")
+        pl.add_text("   ".join(parts), position="lower_right", font_size=9, color="#1d2421", name="rot")
+        apply_box()
+
+    # ---- 단면 보기: X 키를 누를 때마다 X → Y → Z 평면 → 끔. 평면은 마우스로 끌어 옮기거나 화살표로 기울일 수 있음
+    def section_off():
+        try:
+            pl.clear_plane_widgets()
+        except Exception:
+            pass
+        # 단면 모델과 함께 생긴 보조 요소(평면 외곽선 등)까지 모두 지운다
+        for nm in tools["clip_names"]:
+            try:
+                pl.remove_actor(nm)
+            except Exception:
+                pass
+        tools["clip_names"] = []
+        body.SetVisibility(True)
+        if edge_actor is not None:
+            edge_actor.SetVisibility(True)
+        tools["section"] = None
+
+    def cycle_section():
+        nxt = {None: "x", "x": "y", "y": "z", "z": None}[tools["section"]]
+        section_off()
+        if nxt:
+            body.SetVisibility(False)
+            if edge_actor is not None:
+                edge_actor.SetVisibility(False)
+            # 잘린 안쪽 면은 붉은색으로 보여 단면 위치를 알아보기 쉽게 한다
+            before = set(pl.renderer.actors.keys())
+            pl.add_mesh_clip_plane(
+                mesh, normal=nxt, crinkle=False, color=model_color, smooth_shading=False,
+                backface_params={"color": "#c0392b"}, widget_color="#1f6feb", outline_opacity=0.15)
+            tools["clip_names"] = [k for k in pl.renderer.actors.keys() if k not in before]
+            tools["section"] = nxt
+        draw_status()
+        pl.render()
+
+    # ---- 거리 측정: D 키로 켜고 끔. 모델 표면을 두 번 클릭하면 두 점 사이 거리(mm)를 표시
+    def clear_measure():
+        for nm in ("m_line", "m_pts", "m_label"):
+            try:
+                pl.remove_actor(nm)
+            except Exception:
+                pass
+        tools["pts"].clear()
+
+    def on_pick(point, *_a):
+        import numpy as np
+        if point is None:
+            return
+        if len(tools["pts"]) >= 2:
+            clear_measure()
+        tools["pts"].append(np.asarray(point, dtype=float))
+        pl.add_points(np.array(tools["pts"]), color="#e67e22", point_size=12,
+                      render_points_as_spheres=True, name="m_pts", pickable=False)
+        if len(tools["pts"]) == 2:
+            a, b = tools["pts"]
+            d = b - a
+            dist = float(np.linalg.norm(d))
+            pl.add_mesh(pv.Line(a, b), color="#e67e22", line_width=3, name="m_line", pickable=False)
+            pl.add_text(f"Distance: {dist:.3f} mm   (dX {abs(d[0]):.3f} / dY {abs(d[1]):.3f} / dZ {abs(d[2]):.3f})",
+                        position="upper_right", font_size=10, color="#b35400", name="m_label")
+        pl.render()
+
+    def toggle_measure():
+        if tools["measure"]:
+            try:
+                pl.disable_picking()
+            except Exception:
+                pass
+            clear_measure()
+            tools["measure"] = False
+        else:
+            pl.enable_surface_point_picking(callback=on_pick, left_clicking=True, show_message=False,
+                                            show_point=False, picker="cell")
+            tools["measure"] = True
+        draw_status()
+        pl.render()
+
+    # ---- 치수 눈금: G 키로 X/Y/Z 축 눈금(mm)을 모델 바깥에 표시
+    def toggle_ruler():
+        if tools["ruler"]:
+            pl.remove_bounds_axes()
+            tools["ruler"] = False
+        else:
+            pl.show_bounds(mesh=mesh, grid=False, location="outer", ticks="outside",
+                           xtitle="X (mm)", ytitle="Y (mm)", ztitle="Z (mm)",
+                           font_size=9, color="#333333", fmt="%.1f")
+            tools["ruler"] = True
+        draw_status()
+        pl.render()
 
     def toggle_rotate():
         state["on"] = not state["on"]
@@ -486,8 +593,16 @@ def show(info: dict, png: str | None = None, color: str | None = None):
         draw_status()
         pl.render()
 
+    def apply_box():
+        # 치수 눈금·단면 기능이 바깥 사각 틀을 새로 만들거나 다시 켜는 경우가 있어,
+        # 이름이 BoundingBox 인 요소 전부를 B 키 상태에 맞춘다
+        for nm, act in list(pl.renderer.actors.items()):
+            if str(nm).startswith("BoundingBox"):
+                act.SetVisibility(tools["box"])
+
     def toggle_box():
-        bbox.SetVisibility(not bbox.GetVisibility())
+        tools["box"] = not tools["box"]
+        apply_box()
         pl.render()
 
     draw_status()
@@ -499,6 +614,9 @@ def show(info: dict, png: str | None = None, color: str | None = None):
     pl.add_key_event("v", lambda: (pl.view_xy(), pl.render()))
     pl.add_key_event("t", lambda: (pl.view_xz(), pl.render()))
     pl.add_key_event("i", lambda: (pl.view_isometric(), pl.render()))
+    pl.add_key_event("x", cycle_section)
+    pl.add_key_event("d", toggle_measure)
+    pl.add_key_event("g", toggle_ruler)
 
     # 타이머 대신 직접 갱신 루프. 창을 닫은 뒤 그리기를 시도하면 프로그램이 죽으므로
     # (access violation) 닫힘 신호를 받는 즉시 루프를 빠져나온다.
@@ -1715,6 +1833,11 @@ def selftest(render: bool = True) -> int:
                 pl.add_text(SHORTCUT_MEMO, position="lower_left", font_size=8)
                 pl.add_axes()
                 pl.add_bounding_box()
+                # 단면·측정·치수 눈금 기능이 쓰는 모듈
+                import vtkmodules.vtkInteractionWidgets  # noqa: F401
+                from vtkmodules.vtkRenderingCore import vtkCellPicker  # noqa: F401
+                pl.show_bounds(mesh=info["_mesh"], location="outer", fmt="%.1f")
+                pl.remove_bounds_axes()
                 log.write_text("OK (no render)\n", encoding="utf-8")
                 return 0
             show(info, png=str(Path(d) / "s.png"))
@@ -1724,6 +1847,11 @@ def selftest(render: bool = True) -> int:
             pl.add_mesh(info["_mesh"], color=DEFAULT_COLOR)
             pl.add_text("self test", position="lower_left", font_size=8)
             pl.show(interactive_update=True, auto_close=False)
+            # 단면·측정·치수 눈금 기능도 실제 창에서 한 번씩 켜 본다
+            pl.add_mesh_clip_plane(info["_mesh"], normal="x", crinkle=False)
+            pl.show_bounds(mesh=info["_mesh"], location="outer", fmt="%.1f")
+            pl.enable_surface_point_picking(callback=lambda *a: None, left_clicking=True,
+                                            show_message=False, show_point=False, picker="cell")
             for _ in range(10):
                 pl.camera.Azimuth(5)
                 pl.renderer.reset_camera_clipping_range()
