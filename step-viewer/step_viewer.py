@@ -2661,6 +2661,8 @@ def _selftest_qt(info: dict):
         from pyvistaqt import QtInteractor
         from qtpy import QtCore, QtWidgets
     except ImportError:
+        if FROZEN:
+            raise
         return  # Qt 가 없는 설치(파이썬 직접 실행)는 예전 방식으로 동작하므로 건너뜀
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     w = QtWidgets.QMainWindow()
@@ -2729,12 +2731,19 @@ def selftest(render: bool = True) -> int:
                 import vtkmodules.vtkInteractionWidgets  # noqa: F401
                 assert add_dimensions(pl, info), "치수 표기 실패"
                 # 한 창 인터페이스(Qt) 구성 요소가 들어 있는지
+                # 한 창 인터페이스(Qt) 구성 요소: exe 배포판에는 반드시 있어야 하고,
+                # 파이썬 직접 실행 PC 는 없으면 예전 방식으로 동작하므로 건너뜀
                 _qt_env()
-                import PySide6.QtCore  # noqa: F401  (qtpy 보다 먼저 직접 불러 실제 오류를 드러냄)
-                import PySide6.QtWidgets  # noqa: F401
-                import pyvistaqt  # noqa: F401
-                from qtpy import QtWidgets  # noqa: F401
-                import vtkmodules.qt.QVTKRenderWindowInteractor  # noqa: F401
+                try:
+                    import PySide6.QtCore  # noqa: F401  (qtpy 보다 먼저 직접 불러 실제 오류를 드러냄)
+                except ImportError:
+                    if FROZEN:
+                        raise
+                else:
+                    import PySide6.QtWidgets  # noqa: F401
+                    import pyvistaqt  # noqa: F401
+                    from qtpy import QtWidgets  # noqa: F401
+                    import vtkmodules.qt.QVTKRenderWindowInteractor  # noqa: F401
                 log.write_text("OK (no render)\n", encoding="utf-8")
                 return 0
             show(info, png=str(Path(d) / "s.png"))

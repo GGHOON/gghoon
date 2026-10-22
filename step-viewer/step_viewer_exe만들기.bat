@@ -43,7 +43,7 @@ echo [2/5] 묶는 중... (5~15분 걸릴 수 있습니다)
   --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtNetwork ^
   --exclude-module PySide6.QtPdf --exclude-module PySide6.QtSvg ^
   --exclude-module cadquery --exclude-module casadi --exclude-module nlopt --exclude-module ezdxf ^
-  --exclude-module IPython --exclude-module trame --exclude-module PyQt5 --exclude-module PySide6 ^
+  --exclude-module IPython --exclude-module trame ^
   --exclude-module numba --exclude-module llvmlite --exclude-module cv2 --exclude-module imageio_ffmpeg ^
   --exclude-module imageio --exclude-module pandas --exclude-module scipy --exclude-module sklearn ^
   step_viewer.py
