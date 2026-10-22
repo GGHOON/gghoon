@@ -2425,7 +2425,19 @@ def gui_qt(a):
     def choose_file():
         if wk["busy"]:
             return
-        fn, _ = QtWidgets.QFileDialog.getOpenFileName(win, "STEP 파일 선택", "", "STEP (*.stp *.step);;모든 파일 (*.*)")
+        # 예전 버전(두 창 방식)과 같은 파일 선택 창을 쓴다. 경로만 받아 메모장으로 넘기는 흐름은 더블클릭과 같다.
+        fn = ""
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            r = tk.Tk()
+            r.withdraw()
+            r.attributes("-topmost", True)
+            fn = filedialog.askopenfilename(parent=r, title="STEP 파일 선택",
+                                            filetypes=[("STEP", "*.stp *.step"), ("모든 파일", "*.*")])
+            r.destroy()
+        except Exception:
+            fn, _ = QtWidgets.QFileDialog.getOpenFileName(win, "STEP 파일 선택", "", "STEP (*.stp *.step);;모든 파일 (*.*)")
         if fn:
             open_path(Path(fn))
 
