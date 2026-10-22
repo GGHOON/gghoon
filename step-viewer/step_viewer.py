@@ -26,7 +26,7 @@ STEP 파일 더블클릭으로 열기(한 번만 등록)
 
 3D 창 조작: 왼쪽 드래그=회전, 휠=확대, Shift+드래그(또는 가운데 버튼)=이동
             Space/A: 자동 회전 켜기·끄기 / ↑↓: 회전 속도 / v: 정면 / t: 상면 / i: 등각
-            x: 단면 보기(X→Y→Z→끔, 평면은 마우스로 이동) / d: 거리 측정(표면 두 점 클릭) / g: 치수 눈금
+            x: 단면 보기(X→Y→Z→끔, 평면은 마우스로 이동) / d: 도면식 치수 표기 켜기·끄기(외형·Ø, 공차 없음)
             w: 와이어프레임 / s: 솔리드 / b: 바깥 사각 틀 켜기·끄기(기본 꺼짐) / q: 종료 (창 아래쪽에 단축키 안내가 표시됨)
 """
 from __future__ import annotations
@@ -105,6 +105,9 @@ SURF_NAMES = {  # GeomAbs_SurfaceType 순서
     0: "PLANE", 1: "CYLINDER", 2: "CONE", 3: "SPHERE", 4: "TORUS", 5: "BEZIER", 6: "BSPLINE",
     7: "REVOLUTION", 8: "EXTRUSION", 9: "OFFSET", 10: "OTHER",
 }
+
+
+CACHE_VER = 2  # 저장된 결과 형식 버전. 올리면 예전 결과는 자동으로 다시 계산된다(치수 표기 정보 추가)
 
 
 def _check_step_text(text: str) -> str:
@@ -274,13 +277,18 @@ def analyze_text(text: str, name: str, default_density: float | None = None, ful
 
     # 원형 모서리의 지름 목록: 구멍, 외경, 필렛 경계 등을 한눈에 보기 위함 (같은 모서리는 한 번만)
     diams = Counter()
+    circles = []  # 도면식 Ø 표기용: [지름, 중심 xyz, 축 방향 xyz, 호의 각도]
     for e in _unique_edges(shape):
         try:
             if BRep_Tool.Degenerated_s(e):
                 continue
             c = BRepAdaptor_Curve(e)
             if c.GetType() == GeomAbs_Circle:
-                diams[round(c.Circle().Radius() * 2, 3)] += 1
+                circ = c.Circle()
+                diams[round(circ.Radius() * 2, 3)] += 1
+                loc, ax = circ.Location(), circ.Axis().Direction()
+                circles.append([round(circ.Radius() * 2, 4), loc.X(), loc.Y(), loc.Z(), ax.X(), ax.Y(), ax.Z(),
+                                abs(c.LastParameter() - c.FirstParameter())])
         except Exception:
             pass
     t4 = _t.perf_counter()
@@ -307,6 +315,9 @@ def analyze_text(text: str, name: str, default_density: float | None = None, ful
         "face_types": dict(face_types),
         "circle_diameters": dict(sorted(diams.items())),
         "_shape": shape,
+        "bbox": [x0, y0, z0, x1, y1, z1],
+        "circles_geo": circles,
+        "cache_ver": CACHE_VER,
         "_meshp": mesh_params((dx * dx + dy * dy + dz * dz) ** 0.5, nfaces),
     }
 
@@ -438,8 +449,129 @@ SHORTCUT_MEMO = (
     "Mouse: L-drag = rotate,  Wheel = zoom,  Shift+L-drag or M-drag = pan\n"
     "Keys : Space or A = auto-rotate,  Up/Down = rotate speed,  Q = quit\n"
     "View : V = front,  T = top,  I = iso,  W = wireframe,  S = solid,  B = box on/off\n"
-    "Tools: X = section (X/Y/Z/off, drag plane),  D = measure (click 2 points),  G = dimension ruler"
+    "Tools: X = section (X/Y/Z/off, drag plane),  D = dimensions on/off"
 )
+
+
+def _fmt_mm(v: float) -> str:
+    """도면식 숫자 표기: 16.000 → 16, 8.900 → 8.9"""
+    t = f"{v:.3f}".rstrip("0").rstrip(".")
+    return t if t not in ("", "-0") else "0"
+
+
+def hole_groups(info: dict, max_labels: int = 12) -> list:
+    """원형 모서리에서 '구멍·축 지름' 표기 목록을 만든다. → [(지름, 개수, 중심, 축방향), ...] 큰 지름부터.
+    - 반원 2개로 나뉜 모서리는 합쳐서 완전한 원만 인정(필렛 등 부분 호는 제외)
+    - 같은 축선·같은 지름(구멍의 위·아래 모서리)은 하나로 셈
+    - 같은 지름이 여러 곳이면 '개수×Ø' 로 묶음 (도면 표기와 같게)"""
+    import math
+    full = {}
+    for d, cx, cy, cz, nx, ny, nz, span in info.get("circles_geo") or []:
+        n = (nx, ny, nz)
+        for comp in n:  # 축 방향 부호 통일
+            if abs(comp) > 1e-9:
+                if comp < 0:
+                    n = (-nx, -ny, -nz)
+                break
+        t = cx * n[0] + cy * n[1] + cz * n[2]
+        foot = (cx - t * n[0], cy - t * n[1], cz - t * n[2])  # 축선의 위치
+        key = (round(d, 3), tuple(round(v, 3) for v in n), tuple(round(v, 2) for v in foot), round(t, 3))
+        g = full.setdefault(key, {"span": 0.0, "c": (cx, cy, cz), "n": n})
+        g["span"] += span
+    by_axis = {}
+    for k, g in full.items():
+        if g["span"] >= 2 * math.pi - 1e-3:
+            by_axis.setdefault(k[:3], g)
+    by_d = {}
+    for k, g in by_axis.items():
+        by_d.setdefault(k[0], []).append(g)
+    out = []
+    for d, gs in sorted(by_d.items(), key=lambda kv: -kv[0])[:max_labels]:
+        out.append((d, len(gs), gs[0]["c"], gs[0]["n"]))
+    return out
+
+
+def add_dimensions(pl, info: dict) -> list:
+    """도면처럼 전체 외형(가로·세로·높이) 치수선과 구멍·축 지름(Ø)을 3D 화면에 표기한다.
+    공차는 STEP(AP214)에 들어 있지 않아 표기하지 않는다. 추가한 요소 이름 목록을 돌려준다."""
+    import numpy as np
+    import pyvista as pv
+
+    bb = info.get("bbox")
+    if not bb:
+        return []
+    x0, y0, z0, x1, y1, z1 = bb
+    L = max(x1 - x0, y1 - y0, z1 - z0) or 1.0
+    m = 0.12 * L          # 모델에서 치수선까지 띄우는 거리
+    ah = 0.035 * L        # 화살표 길이
+    col, tcol = "#1f4e79", "#0b2a4a"
+    lines, arrows, lab_pts, lab_txt = [], [], [], []
+
+    def dim(p, q, ext_from_p, ext_from_q, text):
+        p, q = np.array(p, float), np.array(q, float)
+        lines.append(pv.Line(p, q))
+        for a, b in ((ext_from_p, p), (ext_from_q, q)):   # 보조선(모델 → 치수선)
+            a = np.array(a, float)
+            lines.append(pv.Line(a, b + (b - a) / (np.linalg.norm(b - a) or 1) * 0.25 * m))
+        u = (q - p) / (np.linalg.norm(q - p) or 1)
+        arrows.append(pv.Cone(center=p + u * ah / 2, direction=-u, height=ah, radius=ah * 0.3, resolution=12))
+        arrows.append(pv.Cone(center=q - u * ah / 2, direction=u, height=ah, radius=ah * 0.3, resolution=12))
+        lab_pts.append((p + q) / 2)
+        lab_txt.append(text)
+
+    # 기본 등각 시점(오른쪽 위 앞에서 내려다봄) 기준으로 보이는 바깥 모서리에 배치
+    # 가로(X): 앞쪽 바닥 모서리, 세로(Y): 오른쪽 바닥 모서리, 높이(Z): 왼쪽 앞 세로 모서리
+    dim((x0, y1 + m, z0), (x1, y1 + m, z0), (x0, y1, z0), (x1, y1, z0), _fmt_mm(x1 - x0))
+    dim((x1 + m, y0, z0), (x1 + m, y1, z0), (x1, y0, z0), (x1, y1, z0), _fmt_mm(y1 - y0))
+    dim((x0 - m * 0.7, y1 + m * 0.7, z0), (x0 - m * 0.7, y1 + m * 0.7, z1), (x0, y1, z0), (x0, y1, z1),
+        _fmt_mm(z1 - z0))
+
+    names = []
+
+    def label(pt, text, color, nm):
+        # 라벨을 하나씩 따로 추가: 한꺼번에 넣으면 겹치는 라벨을 VTK 가 자동으로 숨겨 버린다
+        pl.add_point_labels(np.array([pt]), [text], font_size=14, text_color=color, bold=True,
+                            shape="rounded_rect", shape_color="white", shape_opacity=0.85, point_size=1,
+                            show_points=False, always_visible=True, name=nm)
+        names.append(nm)
+
+    pl.add_mesh(pv.merge(lines), color=col, line_width=2, name="dim_lines", pickable=False)
+    pl.add_mesh(pv.merge(arrows), color=col, name="dim_arrows", pickable=False)
+    names += ["dim_lines", "dim_arrows"]
+    for i, (pt, t) in enumerate(zip(lab_pts, lab_txt)):
+        label(pt, t, tcol, f"dim_label{i}")
+
+    # 구멍·축 지름: 원 위의 한 점에서 바깥쪽으로 지시선을 긋고 Ø 표기
+    holes = hole_groups(info)
+    if holes:
+        leaders, pts, txt = [], [], []
+        ctr = np.array([(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2])
+        axis_seen = {}
+        for i, (d, cnt, c, n) in enumerate(holes):
+            c, n = np.array(c, float), np.array(n, float)
+            w = np.array([1.0, 1.0, 1.0]) + (c - ctr) / L   # 모델 바깥(오른쪽 위) 방향으로 지시선을 뺀다
+            u = w - w.dot(n) * n
+            if np.linalg.norm(u) < 1e-6:
+                u = np.cross(n, [0, 0, 1]) if abs(n[2]) < 0.9 else np.cross(n, [1, 0, 0])
+            u /= np.linalg.norm(u)
+            # 같은 축에 여러 지름(단차 보어 등)이 있으면 지시선 방향을 축 둘레로 45°씩 돌려 라벨이 겹치지 않게
+            akey = tuple(np.round(c - c.dot(n) * n, 2)) + tuple(np.round(n, 3))
+            k = axis_seen.get(akey, 0)
+            axis_seen[akey] = k + 1
+            if k:
+                ang = np.radians(45.0 * k)
+                u = u * np.cos(ang) + np.cross(n, u) * np.sin(ang)
+            on = c + u * d / 2                      # 원 둘레 위의 점
+            # 같은 축의 구멍들(단차 보어 등)이 겹치지 않게 지시선 길이를 조금씩 다르게
+            tip = on + (u + n * 0.4) / np.linalg.norm(u + n * 0.4) * (0.16 + 0.04 * (k % 3)) * L
+            leaders.append(pv.Line(on, tip))
+            pts.append(tip)
+            txt.append((f"{cnt}×" if cnt > 1 else "") + "Ø" + _fmt_mm(d))
+        pl.add_mesh(pv.merge(leaders), color="#8a3b00", line_width=2, name="hole_leaders", pickable=False)
+        names.append("hole_leaders")
+        for i, (pt, t) in enumerate(zip(pts, txt)):
+            label(pt, t, "#8a3b00", f"hole_label{i}")
+    return names
 
 
 def show(info: dict, png: str | None = None, color: str | None = None):
@@ -456,9 +588,20 @@ def show(info: dict, png: str | None = None, color: str | None = None):
     pl.add_axes()
     pl.set_background("#eef0ee")
     pl.add_text(format_overlay(info), position="upper_left", font_size=9, color="#1d2421")
-    bbox = pl.add_bounding_box(color="#999999", line_width=1)  # 사각 틀: B 키로 켜고 끔
-    bbox.SetVisibility(False)  # 기본은 꺼짐
+    # 바깥 사각 틀: B 키로 켜고 끔(기본 꺼짐). pyvista 내장 상자는 치수선·단면 등 요소를 추가할 때마다
+    # 다시 만들어지며 저절로 켜지는 문제가 있어(B 키와 충돌), 모델 외곽선을 직접 그린다.
+    bbox = pl.add_mesh(pv.Box(bounds=mesh.bounds).outline(), color="#999999", line_width=1,
+                       name="box_outline", pickable=False)
+    bbox.SetVisibility(False)
     pl.camera_position = "iso"
+    pl.renderer.reset_camera_clipping_range()
+
+    # 도면식 치수 표기 (기본 켜짐, D 키로 켜고 끔)
+    try:
+        dim_names = add_dimensions(pl, info)
+    except Exception:
+        dim_names = []
+    pl.camera_position = "iso"   # 치수선까지 화면에 다 들어오도록 시점을 다시 맞춤
     pl.renderer.reset_camera_clipping_range()
 
     # 창 아래쪽 단축키 안내 (VTK 기본 글꼴에 한글이 없어 영문으로 표시)
@@ -480,16 +623,13 @@ def show(info: dict, png: str | None = None, color: str | None = None):
     # ---- 자동 회전: Space(또는 A)로 켜고 끔, 위/아래 화살표로 속도 조절
     # (+/- 는 VTK 기본 기능(선 굵기)과 겹쳐서 쓰지 않는다)
     state = {"on": False, "speed": 1.0}   # speed: 프레임당 회전 각도(도)
-    tools = {"section": None, "clip_names": [], "measure": False, "pts": [], "ruler": False, "box": False}
+    tools = {"section": None, "clip_names": [], "dims": bool(dim_names), "box": False}
 
     def draw_status():
         parts = [f"AUTO-ROTATE: ON ({state['speed']:.1f})" if state["on"] else "AUTO-ROTATE: OFF (Space)"]
         if tools["section"]:
             parts.append(f"SECTION: {tools['section'].upper()}")
-        if tools["measure"]:
-            parts.append("MEASURE: click 2 points")
-        if tools["ruler"]:
-            parts.append("RULER")
+        parts.append("DIM: ON (D)" if tools["dims"] else "DIM: OFF (D)")
         pl.add_text("   ".join(parts), position="lower_right", font_size=9, color="#1d2421", name="rot")
         apply_box()
 
@@ -528,58 +668,13 @@ def show(info: dict, png: str | None = None, color: str | None = None):
         draw_status()
         pl.render()
 
-    # ---- 거리 측정: D 키로 켜고 끔. 모델 표면을 두 번 클릭하면 두 점 사이 거리(mm)를 표시
-    def clear_measure():
-        for nm in ("m_line", "m_pts", "m_label"):
-            try:
-                pl.remove_actor(nm)
-            except Exception:
-                pass
-        tools["pts"].clear()
-
-    def on_pick(point, *_a):
-        import numpy as np
-        if point is None:
-            return
-        if len(tools["pts"]) >= 2:
-            clear_measure()
-        tools["pts"].append(np.asarray(point, dtype=float))
-        pl.add_points(np.array(tools["pts"]), color="#e67e22", point_size=12,
-                      render_points_as_spheres=True, name="m_pts", pickable=False)
-        if len(tools["pts"]) == 2:
-            a, b = tools["pts"]
-            d = b - a
-            dist = float(np.linalg.norm(d))
-            pl.add_mesh(pv.Line(a, b), color="#e67e22", line_width=3, name="m_line", pickable=False)
-            pl.add_text(f"Distance: {dist:.3f} mm   (dX {abs(d[0]):.3f} / dY {abs(d[1]):.3f} / dZ {abs(d[2]):.3f})",
-                        position="upper_right", font_size=10, color="#b35400", name="m_label")
-        pl.render()
-
-    def toggle_measure():
-        if tools["measure"]:
-            try:
-                pl.disable_picking()
-            except Exception:
-                pass
-            clear_measure()
-            tools["measure"] = False
-        else:
-            pl.enable_surface_point_picking(callback=on_pick, left_clicking=True, show_message=False,
-                                            show_point=False, picker="cell")
-            tools["measure"] = True
-        draw_status()
-        pl.render()
-
-    # ---- 치수 눈금: G 키로 X/Y/Z 축 눈금(mm)을 모델 바깥에 표시
-    def toggle_ruler():
-        if tools["ruler"]:
-            pl.remove_bounds_axes()
-            tools["ruler"] = False
-        else:
-            pl.show_bounds(mesh=mesh, grid=False, location="outer", ticks="outside",
-                           xtitle="X (mm)", ytitle="Y (mm)", ztitle="Z (mm)",
-                           font_size=9, color="#333333", fmt="%.1f")
-            tools["ruler"] = True
+    # ---- 치수 표기: D 키로 켜고 끔 (단면 보기 중에도 그대로 보임)
+    def toggle_dims():
+        tools["dims"] = not tools["dims"]
+        for nm, act in list(pl.renderer.actors.items()):
+            # 라벨은 pyvista 가 '이름-labels' 처럼 뒤에 붙여 저장하므로 앞부분으로 찾는다
+            if any(str(nm) == d or str(nm).startswith(d + "-") for d in dim_names):
+                act.SetVisibility(tools["dims"])
         draw_status()
         pl.render()
 
@@ -594,11 +689,7 @@ def show(info: dict, png: str | None = None, color: str | None = None):
         pl.render()
 
     def apply_box():
-        # 치수 눈금·단면 기능이 바깥 사각 틀을 새로 만들거나 다시 켜는 경우가 있어,
-        # 이름이 BoundingBox 인 요소 전부를 B 키 상태에 맞춘다
-        for nm, act in list(pl.renderer.actors.items()):
-            if str(nm).startswith("BoundingBox"):
-                act.SetVisibility(tools["box"])
+        bbox.SetVisibility(tools["box"])
 
     def toggle_box():
         tools["box"] = not tools["box"]
@@ -615,8 +706,7 @@ def show(info: dict, png: str | None = None, color: str | None = None):
     pl.add_key_event("t", lambda: (pl.view_xz(), pl.render()))
     pl.add_key_event("i", lambda: (pl.view_isometric(), pl.render()))
     pl.add_key_event("x", cycle_section)
-    pl.add_key_event("d", toggle_measure)
-    pl.add_key_event("g", toggle_ruler)
+    pl.add_key_event("d", toggle_dims)
 
     # 타이머 대신 직접 갱신 루프. 창을 닫은 뒤 그리기를 시도하면 프로그램이 죽으므로
     # (access violation) 닫힘 신호를 받는 즉시 루프를 빠져나온다.
@@ -697,7 +787,7 @@ def batch(folder: Path, out_csv: Path, density: float | None):
         try:
             info = analyze_file(p, density)
             info.pop("_shape")
-            for k in ("file_density", "_meshp", "timing_detail"):
+            for k in ("file_density", "_meshp", "timing_detail", "circles_geo", "bbox", "cache_ver"):
                 info.pop(k, None)
             info["face_types"] = "; ".join(f"{k}:{v}" for k, v in info["face_types"].items())
             info["circle_diameters"] = "; ".join(f"{d:g}x{n}" for d, n in info["circle_diameters"].items())
@@ -1012,6 +1102,8 @@ def load_cached(d: Path, name: str, default_density: float | None):
     import pyvista as pv
     try:
         info = json.loads((d / "info.json").read_text(encoding="utf-8"))
+        if info.get("cache_ver", 1) < CACHE_VER:
+            return None  # 예전 형식 → 다시 계산
         info["_mesh"] = pv.read(str(d / "mesh.vtp"))
     except Exception:
         return None
@@ -1835,9 +1927,7 @@ def selftest(render: bool = True) -> int:
                 pl.add_bounding_box()
                 # 단면·측정·치수 눈금 기능이 쓰는 모듈
                 import vtkmodules.vtkInteractionWidgets  # noqa: F401
-                from vtkmodules.vtkRenderingCore import vtkCellPicker  # noqa: F401
-                pl.show_bounds(mesh=info["_mesh"], location="outer", fmt="%.1f")
-                pl.remove_bounds_axes()
+                assert add_dimensions(pl, info), "치수 표기 실패"
                 log.write_text("OK (no render)\n", encoding="utf-8")
                 return 0
             show(info, png=str(Path(d) / "s.png"))
@@ -1849,9 +1939,7 @@ def selftest(render: bool = True) -> int:
             pl.show(interactive_update=True, auto_close=False)
             # 단면·측정·치수 눈금 기능도 실제 창에서 한 번씩 켜 본다
             pl.add_mesh_clip_plane(info["_mesh"], normal="x", crinkle=False)
-            pl.show_bounds(mesh=info["_mesh"], location="outer", fmt="%.1f")
-            pl.enable_surface_point_picking(callback=lambda *a: None, left_clicking=True,
-                                            show_message=False, show_point=False, picker="cell")
+            add_dimensions(pl, info)
             for _ in range(10):
                 pl.camera.Azimuth(5)
                 pl.renderer.reset_camera_clipping_range()
