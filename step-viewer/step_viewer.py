@@ -2730,6 +2730,8 @@ def selftest(render: bool = True) -> int:
                 assert add_dimensions(pl, info), "치수 표기 실패"
                 # 한 창 인터페이스(Qt) 구성 요소가 들어 있는지
                 _qt_env()
+                import PySide6.QtCore  # noqa: F401  (qtpy 보다 먼저 직접 불러 실제 오류를 드러냄)
+                import PySide6.QtWidgets  # noqa: F401
                 import pyvistaqt  # noqa: F401
                 from qtpy import QtWidgets  # noqa: F401
                 import vtkmodules.qt.QVTKRenderWindowInteractor  # noqa: F401
