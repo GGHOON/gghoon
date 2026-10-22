@@ -1978,6 +1978,11 @@ def _qt_icon(kind: str):
         p.drawPolygon(QtGui.QPolygonF([P(24, 18), P(20, 16), P(20, 20)]))
         f = p.font(); f.setPointSize(8); f.setBold(True); p.setFont(f)
         p.drawText(QtCore.QRectF(0, 1, S, 12), QtCore.Qt.AlignCenter, "Ø")
+    elif kind == "measure":   # 두 점 거리 측정: 점 두 개 + 잇는 선
+        p.setPen(QtGui.QPen(QtGui.QColor("#d6006f"), 2.0))
+        p.drawLine(P(6, 21), P(22, 7))
+        p.setBrush(QtGui.QColor("#d6006f")); p.setPen(QtCore.Qt.NoPen)
+        p.drawEllipse(QtCore.QRectF(2.5, 17.5, 7, 7)); p.drawEllipse(QtCore.QRectF(18.5, 3.5, 7, 7))
     elif kind == "box":
         p.setPen(QtGui.QPen(QtGui.QColor("#6e6e73"), 1.3, QtCore.Qt.DashLine))
         p.setBrush(QtCore.Qt.NoBrush)
@@ -2271,6 +2276,7 @@ def gui_qt(a):
     dens_edit.setPlaceholderText("파일에 밀도가 없을 때만 사용 (예: 7.85)")
     form.addRow("밀도 g/cm³", dens_edit)
     hint = QtWidgets.QLabel("마우스를 선·호·면에 올리면 아래에 치수가 나옵니다.\n"
+                            "M 거리 측정: 점 두 개 클릭 → 거리 (원은 중심에 붙음, Esc 지우기)\n"
                             "마우스: 왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동\n"
                             "단축키: Space 자동회전 · V 정면 · T 윗면 · I 등각 · X 단면 · D 치수표기 · B 상자")
     hint.setObjectName("hint"); hint.setWordWrap(True)
@@ -2312,6 +2318,37 @@ def gui_qt(a):
                 pass
             hov["hl"] = None
 
+    def _edge_segments(feat):
+        """모서리 표본점을 선분으로 묶어 둔다(한 번만). 가장 가까운 모서리를 '선분까지 거리'로 정확히 찾기 위함."""
+        if "_segA" not in feat:
+            P, I = feat["edge_pts"].astype(float), feat["edge_idx"]
+            ok = I[1:] == I[:-1]
+            feat["_segA"], feat["_segB"], feat["_segE"] = P[:-1][ok], P[1:][ok], I[:-1][ok]
+        return feat["_segA"], feat["_segB"], feat["_segE"]
+
+    def _nearest_edge(feat, world):
+        """→ (모서리 번호, 거리, 모서리 위 가장 가까운 점) / 없으면 None"""
+        if not feat or not len(feat["edge_pts"]):
+            return None
+        A, B, E = _edge_segments(feat)
+        if not len(A):
+            return None
+        D = B - A
+        t = _np.clip(_np.einsum("ij,ij->i", world - A, D) / _np.maximum(_np.einsum("ij,ij->i", D, D), 1e-30), 0, 1)
+        Q = A + D * t[:, None]
+        dq = _np.einsum("ij,ij->i", Q - world, Q - world)
+        k = int(_np.argmin(dq))
+        return int(E[k]), float(dq[k] ** 0.5), Q[k]
+
+    def _px_world(world, px=1.0):
+        """그 위치에서 화면 px 픽셀이 실제 몇 mm 인지 (확대하면 작아짐)"""
+        cam = pl.camera
+        H = max(1, pl.renderer.GetSize()[1])
+        if cam.GetParallelProjection():
+            return 2.0 * cam.GetParallelScale() / H * px
+        dist = float(_np.linalg.norm(_np.array(cam.GetPosition()) - world))
+        return 2.0 * dist * _np.tan(_np.radians(cam.GetViewAngle() / 2)) / H * px
+
     def on_move(_obj=None, _evt=None):
         if scene.body is None or wk["busy"]:
             return
@@ -2333,14 +2370,12 @@ def gui_qt(a):
         world = _np.array(pk.GetPickPosition(), float)
         txt, hl_pts = "", None
         diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
-        # 1) 가까운 모서리(선/호/원)인가?
-        if feat and len(feat["edge_pts"]):
-            dp = feat["edge_pts"] - world
-            j = int(_np.argmin(_np.einsum("ij,ij->i", dp, dp)))
-            if _np.linalg.norm(feat["edge_pts"][j] - world) < diag * 0.012:
-                ei = int(feat["edge_idx"][j])
-                txt = feat["edge_text"][ei]
-                hl_pts = feat["edge_pts"][feat["edge_idx"] == ei]
+        # 1) 가까운 모서리(선/호/원)인가? (화면에서 약 7픽셀 이내)
+        ne = _nearest_edge(feat, world)
+        if ne is not None and ne[1] < max(_px_world(world, 7), diag * 1e-4):
+            ei = ne[0]
+            txt = feat["edge_text"][ei]
+            hl_pts = feat["edge_pts"][feat["edge_idx"] == ei]
         # 2) 아니면 올린 면의 치수
         if not txt and feat:
             try:
@@ -2350,6 +2385,8 @@ def gui_qt(a):
                 txt = ""
         if txt != hov["txt"]:
             hov["txt"] = txt
+            if txt:
+                status.clearMessage()   # 임시 안내 문구가 이 칸을 가리지 않게
             hover_lbl.setText(("  " + txt) if txt else "")
             _clear_hover_hl()
             if hl_pts is not None and len(hl_pts) > 1:
@@ -2440,6 +2477,179 @@ def gui_qt(a):
     ac_dims.setChecked(False); ac_dims.toggled.connect(toggle_dims)
     ac_box = act(headsup, "box", "", checkable=True, tip="외곽 상자 (B)", shortcut="B")
     ac_box.toggled.connect(toggle_box)
+
+    # ---- 두 점 거리 측정 (M): 측정 모드에서 클릭 두 번 → 두 점 사이 거리와 ΔX/ΔY/ΔZ
+    # 클릭 위치가 꼭짓점·원(호) 모서리·모서리 근처면 그 점(원은 중심)에 맞춰 붙고, 아니면 면 위의 점.
+    # 드래그(회전)와 구분하려고 누른 자리와 뗀 자리가 거의 같을 때만 점으로 인정.
+    meas = {"on": False, "pts": [], "names": [], "down": None, "picker": vtkCellPicker()}
+    meas["picker"].SetTolerance(0.0008)
+    meas_lbl = QtWidgets.QLabel("")
+    meas_lbl.setStyleSheet("QLabel { color: #a3004f; font-weight: 700; padding: 0 8px; }")
+    status.addWidget(meas_lbl)
+
+    def _circle_center(P3):
+        a, b, c = (_np.asarray(v, float) for v in P3)
+        ab, ac = b - a, c - a
+        n = _np.cross(ab, ac)
+        nn = float(n @ n)
+        if nn < 1e-18:
+            return None
+        return a + (_np.cross(n, ab) * float(ac @ ac) + _np.cross(ac, n) * float(ab @ ab)) / (2 * nn)
+
+    def _snap(world, cid, actor):
+        """클릭한 자리 → (점, 종류 설명, 평면이면 법선)"""
+        feat = scene.feat
+        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
+        tol = max(_px_world(world, 7), diag * 1e-4)      # 모서리에 붙는 범위: 화면 약 7픽셀
+        vtol = max(_px_world(world, 10), diag * 1e-4)    # 꼭짓점에 붙는 범위: 화면 약 10픽셀
+        normal = None
+        if feat and actor is scene.body and cid >= 0:
+            try:
+                fid = int(scene.mesh.cell_data["face_id"][cid])
+                if feat["face_text"][fid].startswith("평면"):
+                    cp = scene.mesh.get_cell(cid).points
+                    n = _np.cross(cp[1] - cp[0], cp[2] - cp[0])
+                    normal = n / (_np.linalg.norm(n) or 1.0)
+            except Exception:
+                normal = None
+        if feat and len(feat["edge_pts"]):
+            # 꼭짓점(원이 아닌 모서리의 끝점)이 가까우면 우선
+            A, B, E = _edge_segments(feat)
+            if "_verts" not in feat:
+                vs = [feat["edge_pts"][feat["edge_idx"] == ei][[0, -1]].astype(float)
+                      for ei, t in enumerate(feat["edge_text"]) if not t.startswith("원")]
+                feat["_verts"] = _np.vstack(vs) if vs else _np.zeros((0, 3))
+            V = feat["_verts"]
+            ne = _nearest_edge(feat, world)
+            near_circle = ne is not None and ne[1] < tol and feat["edge_text"][ne[0]][:1] in ("원", "호")
+            if len(V):
+                dv = _np.einsum("ij,ij->i", V - world, V - world)
+                k = int(_np.argmin(dv))
+                # 원·호 위를 찍었으면 중심이 우선 (작은 구멍의 이음매 꼭짓점에 잘못 붙지 않게), 꼭짓점 바로 위면 꼭짓점
+                if dv[k] ** 0.5 < (max(_px_world(world, 3), diag * 1e-4) if near_circle else vtol):
+                    return V[k], "꼭짓점", None
+            if ne is not None and ne[1] < tol:
+                ei, _dist, q = ne
+                ep = feat["edge_pts"][feat["edge_idx"] == ei].astype(float)
+                et = feat["edge_text"][ei]
+                if et.startswith("원") or et.startswith("호"):     # 원·호 → 중심
+                    m = len(ep) - 1
+                    c = _circle_center((ep[0], ep[m // 3], ep[(2 * m) // 3]))
+                    if c is not None:
+                        return c, et.split("  ")[0] + " 중심 (" + et.split("  ", 1)[-1] + ")", None
+                return q, "모서리 위 점", None
+        return world, ("평면 위 점" if normal is not None else "면 위 점"), normal
+
+    def _meas_overlay():
+        """측정 점·선을 모델 위에 한 번 더 연하게 그리는 층 (구멍 안쪽 중심처럼 가려진 점도 보이게)"""
+        from vtkmodules.vtkRenderingCore import vtkRenderer
+        ov = meas.get("ov")
+        if ov is None:
+            ov = vtkRenderer(); ov.SetLayer(1); ov.InteractiveOff()
+            rw = pl.ren_win
+            rw.SetNumberOfLayers(max(2, rw.GetNumberOfLayers()))
+            rw.AddRenderer(ov)
+            meas["ov"] = ov
+        ov.SetViewport(pl.renderer.GetViewport())
+        ov.SetActiveCamera(pl.renderer.GetActiveCamera())
+        return ov
+
+    def meas_clear(render=True):
+        for nm in meas["names"]:
+            try:
+                pl.remove_actor(nm)
+            except Exception:
+                pass
+        if meas.get("ov") is not None:
+            meas["ov"].RemoveAllViewProps()
+        meas["names"], meas["pts"] = [], []
+        meas_lbl.setText("")
+        if render:
+            pl.render()
+
+    def _meas_add(mesh, **kw):
+        nm = kw.pop("name")
+        pl.add_mesh(mesh, name=nm, pickable=False, **kw)
+        meas["names"].append(nm)
+        try:   # 가려진 부분은 연하게
+            _overlay_add(_meas_overlay(), mesh, kw.get("color", "#d6006f"), kw.get("line_width", 1.5), 0.45)
+        except Exception:
+            pass
+
+    def meas_pick(x, y):
+        import pyvista as pv
+        if scene.body is None:
+            return
+        pk = meas["picker"]
+        if not pk.Pick(x, y, 0, pl.renderer) or pk.GetActor() is None:
+            return
+        world = _np.array(pk.GetPickPosition(), float)
+        p, kind, nrm = _snap(world, pk.GetCellId(), pk.GetActor())
+        if len(meas["pts"]) >= 2:          # 세 번째 클릭 → 새 측정 시작
+            meas_clear(render=False)
+        meas["pts"].append((p, kind, nrm))
+        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
+        i = len(meas["pts"])
+        _meas_add(pv.Sphere(radius=diag * 0.006, center=p), color="#d6006f", name=f"meas_p{i}")
+        if i == 1:
+            status.clearMessage()
+            meas_lbl.setText(f"  점1: {kind}  → 두 번째 점을 클릭하세요")
+        else:
+            (p1, k1, n1), (p2, k2, n2) = meas["pts"]
+            d = p2 - p1
+            L = float(_np.linalg.norm(d))
+            _meas_add(pv.Line(p1, p2), color="#d6006f", line_width=3, name="meas_line")
+            txt = f"거리 {_fmt_mm(L)} mm"
+            extra = ""
+            if n1 is not None and n2 is not None and abs(float(n1 @ n2)) > 0.9999:   # 두 평행 평면
+                extra = f"   ·   평행면 간 거리 {_fmt_mm(abs(float(d @ n1)))}"
+            try:
+                pl.add_point_labels([(p1 + p2) / 2], [txt], name="meas_text", font_size=15, bold=True,
+                                    text_color="#ffffff", shape_color="#d6006f", shape_opacity=0.9,
+                                    point_size=0, show_points=False, always_visible=True, pickable=False)
+                meas["names"].append("meas_text")
+            except Exception:
+                pass
+            status.clearMessage()
+            meas_lbl.setText(f"  {txt}   (ΔX {_fmt_mm(abs(d[0]))} · ΔY {_fmt_mm(abs(d[1]))} · ΔZ {_fmt_mm(abs(d[2]))})"
+                             f"{extra}   [{k1} → {k2}]")
+        pl.render()
+
+    def on_press(_obj=None, _evt=None):
+        meas["down"] = pl.iren.interactor.GetEventPosition() if meas["on"] else None
+        if meas.get("ov") is not None:   # 카메라가 바뀌었을 수 있어 겹침 층을 다시 맞춤
+            _meas_overlay()
+
+    def on_release(_obj=None, _evt=None):
+        if not meas["on"] or meas["down"] is None or wk["busy"]:
+            return
+        x, y = pl.iren.interactor.GetEventPosition()
+        x0, y0 = meas["down"]
+        meas["down"] = None
+        if abs(x - x0) <= 4 and abs(y - y0) <= 4:     # 드래그가 아닌 클릭
+            meas_pick(x, y)
+
+    try:
+        pl.iren.add_observer("LeftButtonPressEvent", on_press)
+        pl.iren.add_observer("LeftButtonReleaseEvent", on_release)
+    except Exception:
+        pass
+
+    def toggle_measure(on):
+        meas["on"] = on
+        if on:
+            status.clearMessage()
+            meas_lbl.setText("  거리 측정: 첫 번째 점을 클릭하세요 (꼭짓점·원 중심·모서리에 자동으로 붙음, Esc 지우기)")
+        else:
+            meas_clear()
+
+    ac_meas = act(headsup, "measure", "", checkable=True,
+                  tip="두 점 거리 측정 (M) — 점 두 개를 차례로 클릭. 원·호는 중심, 꼭짓점·모서리에 자동으로 붙음. Esc 지우기",
+                  shortcut="M")
+    ac_meas.toggled.connect(toggle_measure)
+    QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), win,
+                        activated=lambda: (meas_clear(), meas["on"] and meas_lbl.setText(
+                            "  거리 측정: 첫 번째 점을 클릭하세요"))).setContext(QtCore.Qt.ApplicationShortcut)
 
     # 자동 회전
     rot = {"speed": 1.0}
@@ -2553,6 +2763,7 @@ def gui_qt(a):
                 refresh_hist()
             except Exception as ex:
                 say(f"기록 저장 실패: {ex}")
+        meas_clear(render=False)   # 이전 모델의 측정 표시 지우기
         scene.load(info, state["color"])
         for k, ac in sec_acts.items():
             ac.setChecked(False)
