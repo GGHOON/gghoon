@@ -107,7 +107,7 @@ SURF_NAMES = {  # GeomAbs_SurfaceType 순서
 }
 
 
-CACHE_VER = 2  # 저장된 결과 형식 버전. 올리면 예전 결과는 자동으로 다시 계산된다(치수 표기 정보 추가)
+CACHE_VER = 3  # 저장된 결과 형식 버전. 올리면 예전 결과는 자동으로 다시 계산된다
 
 
 def _check_step_text(text: str) -> str:
@@ -441,6 +441,166 @@ def build_mesh(shape, params=None):
     if mesh.n_cells == 0:
         raise RuntimeError("3D 메시를 만들지 못했습니다.")
     return mesh.clean()  # STL 은 삼각형마다 점이 따로라서 같은 위치 점을 합쳐야 모서리선이 제대로 나온다
+
+
+def _surface_text(face) -> str:
+    """면 하나의 치수 설명. 마우스를 올렸을 때 보여 줄 문구."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import (GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus)
+    import math
+    try:
+        s = BRepAdaptor_Surface(face, False)
+        t = s.GetType()
+        if t == GeomAbs_Cylinder:
+            return "원통면  Ø" + _fmt_mm(s.Cylinder().Radius() * 2)
+        if t == GeomAbs_Cone:
+            return "원뿔면  반각 %.1f°" % math.degrees(s.Cone().SemiAngle())
+        if t == GeomAbs_Torus:
+            return "라운드(필렛)  R" + _fmt_mm(s.Torus().MinorRadius())
+        if t == GeomAbs_Sphere:
+            return "구면  Ø" + _fmt_mm(s.Sphere().Radius() * 2)
+        if t == GeomAbs_Plane:
+            return "평면"
+    except Exception:
+        pass
+    return "곡면"
+
+
+def _edge_feature(edge):
+    """모서리 하나의 (설명, 표본점배열). 표본점은 '어느 모서리에 올렸나' 판별용."""
+    import numpy as np
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Line
+    import math
+    try:
+        if BRep_Tool.Degenerated_s(edge):
+            return None
+        c = BRepAdaptor_Curve(edge)
+        a, b = c.FirstParameter(), c.LastParameter()
+        t = c.GetType()
+        if t == GeomAbs_Line:
+            p0, p1 = c.Value(a), c.Value(b)
+            L = ((p1.X() - p0.X()) ** 2 + (p1.Y() - p0.Y()) ** 2 + (p1.Z() - p0.Z()) ** 2) ** 0.5
+            n = 4
+            txt = "직선  길이 " + _fmt_mm(L)
+        elif t == GeomAbs_Circle:
+            circ = c.Circle()
+            ang = math.degrees(abs(b - a))
+            n = 32
+            if ang >= 359.5:
+                txt = "원  Ø" + _fmt_mm(circ.Radius() * 2)
+            else:
+                txt = "호  R" + _fmt_mm(circ.Radius()) + "  %.0f°" % ang
+        else:
+            n = 16
+            txt = "곡선"
+        pts = np.empty((n + 1, 3), dtype=np.float32)
+        for i in range(n + 1):
+            v = c.Value(a + (b - a) * i / n)
+            pts[i] = (v.X(), v.Y(), v.Z())
+        return txt, pts
+    except Exception:
+        return None
+
+
+def tessellate_faces(shape):
+    """면마다 삼각형을 모아 하나의 메시로 만들고, 삼각형마다 '면 번호'를 붙인다.
+    (마우스 올린 위치가 어느 면인지 알아내기 위함) → (mesh, 면별 설명 목록)"""
+    import numpy as np
+    import pyvista as pv
+    from OCP.BRep import BRep_Tool
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+    allp, allt, fid, ftext = [], [], [], []
+    off, nf = 0, 0
+    ex = TopExp_Explorer(shape, TopAbs_FACE)
+    while ex.More():
+        f = TopoDS.Face_s(ex.Current())
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(f, loc)
+        if tri is not None:
+            n, m = tri.NbNodes(), tri.NbTriangles()
+            T = loc.Transformation()
+            P = np.empty((n, 3))
+            for i in range(n):
+                v = tri.Node(i + 1).Transformed(T)
+                P[i] = (v.X(), v.Y(), v.Z())
+            TR = np.empty((m, 3), dtype=np.int64)
+            for i in range(m):
+                c = tri.Triangle(i + 1)
+                TR[i] = (c.Value(1), c.Value(2), c.Value(3))
+            allp.append(P)
+            allt.append(TR - 1 + off)
+            fid.append(np.full(m, nf, dtype=np.int32))
+            off += n
+        ftext.append(_surface_text(f))
+        nf += 1
+        ex.Next()
+    if not allp:
+        raise RuntimeError("3D 메시를 만들지 못했습니다.")
+    pts = np.vstack(allp)
+    tr = np.vstack(allt)
+    faces = np.hstack([np.full((len(tr), 1), 3, dtype=np.int64), tr]).ravel()
+    mesh = pv.PolyData(pts, faces)
+    mesh.cell_data["face_id"] = np.concatenate(fid)
+    return mesh.clean(), ftext
+
+
+def build_surface_features(shape, params=None):
+    """3D 메시(면 번호 포함) + 마우스 올림 치수용 정보(면 설명, 모서리 설명·표본점)를 만든다."""
+    import numpy as np
+    if params is None:
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+        b = Bnd_Box()
+        BRepBndLib.Add_s(shape, b, False)
+        x0, y0, z0, x1, y1, z1 = b.Get()
+        params = mesh_params(((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2) ** 0.5, sum(1 for _ in _faces(shape)))
+    tol, ang = params
+    _mesh_shape(shape, tol, ang)
+    mesh, face_text = tessellate_faces(shape)
+    edge_pts, edge_idx, edge_text = [], [], []
+    for e in _unique_edges(shape):
+        r = _edge_feature(e)
+        if r is None:
+            continue
+        txt, pts = r
+        edge_idx.append(np.full(len(pts), len(edge_text), dtype=np.int32))
+        edge_pts.append(pts)
+        edge_text.append(txt)
+    feat = {
+        "mesh": mesh,
+        "face_text": face_text,
+        "edge_text": edge_text,
+        "edge_pts": np.vstack(edge_pts) if edge_pts else np.zeros((0, 3), np.float32),
+        "edge_idx": np.concatenate(edge_idx) if edge_idx else np.zeros((0,), np.int32),
+    }
+    return feat
+
+
+def save_features(d: Path, feat: dict):
+    """mesh 는 호출한 쪽에서 저장하고, 여기서는 치수용 정보만 저장한다."""
+    import json
+    import numpy as np
+    np.savez_compressed(str(d / "features.npz"), edge_pts=feat["edge_pts"], edge_idx=feat["edge_idx"])
+    (d / "features.json").write_text(
+        json.dumps({"face_text": feat["face_text"], "edge_text": feat["edge_text"]}, ensure_ascii=False),
+        encoding="utf-8")
+
+
+def load_features(d: Path, mesh):
+    import json
+    import numpy as np
+    try:
+        z = np.load(str(d / "features.npz"))
+        meta = json.loads((d / "features.json").read_text(encoding="utf-8"))
+        return {"mesh": mesh, "edge_pts": z["edge_pts"], "edge_idx": z["edge_idx"],
+                "face_text": meta["face_text"], "edge_text": meta["edge_text"]}
+    except Exception:
+        return None
 
 
 DEFAULT_COLOR = "#b0b7bd"  # 파일에 색이 없을 때 쓰는 은회색
@@ -1205,6 +1365,7 @@ def load_cached(d: Path, name: str, default_density: float | None):
         if info.get("cache_ver", 1) < CACHE_VER:
             return None  # 예전 형식 → 다시 계산
         info["_mesh"] = pv.read(str(d / "mesh.vtp"))
+        info["_feat"] = load_features(d, info["_mesh"])
     except Exception:
         return None
     info["circle_diameters"] = {float(k): v for k, v in info.get("circle_diameters", [])}
@@ -1275,9 +1436,11 @@ def worker_main():
             t1 = time.perf_counter()
             send(kind="stage", job=jid, msg="3D 메시 생성 중 (모든 CPU 코어 사용)")
             params = info.pop("_meshp", None)
-            mesh = build_mesh(info.pop("_shape"), params)
+            feat = build_surface_features(info.pop("_shape"), params)
+            mesh = feat["mesh"]
             t2 = time.perf_counter()
             mesh.save(str(d / "mesh.vtp"))
+            save_features(d, feat)
             info["circle_diameters"] = [[k, v] for k, v in info["circle_diameters"].items()]
             info["timing"] = {"parse": round(t1 - t0, 1), "mesh": round(t2 - t1, 1), **{"d_" + k: v for k, v in info.get("timing_detail", {}).items()}}
             (d / "info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
@@ -1871,9 +2034,10 @@ class _Scene:
         self.info = None
         self.mesh = None
         self.body = self.edges = self.box = None
+        self.feat = None
         self.dim_names, self.clip_names = [], []
         self.section = None
-        self.dims_on, self.box_on, self.style = True, False, "shaded_edges"
+        self.dims_on, self.box_on, self.style = False, False, "shaded_edges"
         self.color = DEFAULT_COLOR
 
     def _bg(self):
@@ -1890,7 +2054,15 @@ class _Scene:
             pass
         self._bg()
         self.info = info
-        self.mesh = info["_mesh"] if info.get("_mesh") is not None else build_mesh(info["_shape"], info.get("_meshp"))
+        feat = info.get("_feat")
+        if feat is None and info.get("_shape") is not None:  # 작업 프로세스 없이 이 창에서 직접 계산한 경우
+            try:
+                feat = build_surface_features(info["_shape"], info.get("_meshp"))
+            except Exception:
+                feat = None
+        self.feat = feat
+        self.mesh = (feat["mesh"] if feat else
+                     (info["_mesh"] if info.get("_mesh") is not None else build_mesh(info["_shape"], info.get("_meshp"))))
         self.color = color or info.get("color") or DEFAULT_COLOR
         self.body = pl.add_mesh(self.mesh, color=self.color, smooth_shading=False, specular=0.4,
                                 split_sharp_edges=True, name="body")
@@ -2081,9 +2253,14 @@ def gui_qt(a):
     tabs.addTab(info_tree, "부품 정보")
 
     def on_info_click(item, _col=0):
-        # '구멍·축 지름' 아래 항목을 누르면 그 지름만 3D 에서 강조, 다른 항목을 누르면 원래대로
+        # '구멍·축 지름' 아래 항목을 누르면 치수 표기를 켜고 그 지름만 강조, 다른 항목을 누르면 원래대로
         idx = item.data(0, 32)
-        highlight_hole(pl, idx if isinstance(idx, int) else None)
+        if isinstance(idx, int):
+            if not scene.dims_on:
+                ac_dims.setChecked(True)   # 치수 표기가 꺼져 있으면 켜서 보이게
+            highlight_hole(pl, idx)
+        else:
+            highlight_hole(pl, None)
 
     info_tree.itemClicked.connect(on_info_click)
     tabs.addTab(hist_box, "이전 기록")
@@ -2093,8 +2270,9 @@ def gui_qt(a):
     dens_edit = QtWidgets.QLineEdit("" if a.density is None else str(a.density))
     dens_edit.setPlaceholderText("파일에 밀도가 없을 때만 사용 (예: 7.85)")
     form.addRow("밀도 g/cm³", dens_edit)
-    hint = QtWidgets.QLabel("마우스: 왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동\n"
-                            "단축키: Space 자동회전 · V 정면 · T 윗면 · I 등각 · X 단면 · D 치수 · B 상자")
+    hint = QtWidgets.QLabel("마우스를 선·호·면에 올리면 아래에 치수가 나옵니다.\n"
+                            "마우스: 왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동\n"
+                            "단축키: Space 자동회전 · V 정면 · T 윗면 · I 등각 · X 단면 · D 치수표기 · B 상자")
     hint.setObjectName("hint"); hint.setWordWrap(True)
     pv_l.addLayout(form)
     pv_l.addWidget(hint)
@@ -2108,10 +2286,82 @@ def gui_qt(a):
     status = win.statusBar()
     prog = QtWidgets.QProgressBar(); prog.setRange(0, 0); prog.setMaximumWidth(160); prog.setVisible(False)
     status.addPermanentWidget(prog)
+    # 마우스를 올린 선·호·면의 치수를 보여 주는 칸 (상태 표시줄 왼쪽)
+    hover_lbl = QtWidgets.QLabel("")
+    hover_lbl.setStyleSheet("QLabel { color: #0b2a4a; font-weight: 600; padding: 0 8px; }")
+    status.addWidget(hover_lbl)
 
     def say(msg):
         status.showMessage(msg)
         app.processEvents()
+
+    # ---- 마우스 올림(hover): 그 자리의 선·호·R·면 치수를 아래 칸에 표시하고 파란 선으로 강조
+    import time as _t2
+
+    import numpy as _np
+    from vtkmodules.vtkRenderingCore import vtkCellPicker
+
+    hov = {"picker": vtkCellPicker(), "last": 0.0, "hl": None, "txt": ""}
+    hov["picker"].SetTolerance(0.0008)
+
+    def _clear_hover_hl():
+        if hov["hl"] is not None:
+            try:
+                pl.remove_actor(hov["hl"])
+            except Exception:
+                pass
+            hov["hl"] = None
+
+    def on_move(_obj=None, _evt=None):
+        if scene.body is None or wk["busy"]:
+            return
+        now = _t2.perf_counter()
+        if now - hov["last"] < 0.03:   # 너무 자주 계산하지 않도록
+            return
+        hov["last"] = now
+        feat = scene.feat
+        iren = pl.iren.interactor
+        x, y = iren.GetEventPosition()
+        pk = hov["picker"]
+        if not pk.Pick(x, y, 0, pl.renderer) or pk.GetActor() is not scene.body:
+            if hov["txt"]:
+                hov["txt"] = ""
+                hover_lbl.setText("")
+                _clear_hover_hl()
+                pl.render()
+            return
+        world = _np.array(pk.GetPickPosition(), float)
+        txt, hl_pts = "", None
+        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
+        # 1) 가까운 모서리(선/호/원)인가?
+        if feat and len(feat["edge_pts"]):
+            dp = feat["edge_pts"] - world
+            j = int(_np.argmin(_np.einsum("ij,ij->i", dp, dp)))
+            if _np.linalg.norm(feat["edge_pts"][j] - world) < diag * 0.012:
+                ei = int(feat["edge_idx"][j])
+                txt = feat["edge_text"][ei]
+                hl_pts = feat["edge_pts"][feat["edge_idx"] == ei]
+        # 2) 아니면 올린 면의 치수
+        if not txt and feat:
+            try:
+                fid = int(scene.mesh.cell_data["face_id"][pk.GetCellId()])
+                txt = feat["face_text"][fid]
+            except Exception:
+                txt = ""
+        if txt != hov["txt"]:
+            hov["txt"] = txt
+            hover_lbl.setText(("  " + txt) if txt else "")
+            _clear_hover_hl()
+            if hl_pts is not None and len(hl_pts) > 1:
+                import pyvista as pv
+                hov["hl"] = pl.add_mesh(pv.lines_from_points(hl_pts), color="#ff6a00", line_width=5,
+                                        name="hover_hl", pickable=False)
+            pl.render()
+
+    try:
+        pl.iren.add_observer("MouseMoveEvent", on_move)
+    except Exception:
+        pass
 
     # ---- 위쪽 명령 도구 모음 (솔리드웍스 CommandManager 처럼 아이콘 아래 글자)
     cmd = QtWidgets.QToolBar("명령"); cmd.setObjectName("command"); cmd.setMovable(False)
@@ -2185,8 +2435,9 @@ def gui_qt(a):
         scene.box_on = on
         scene.apply()
 
-    ac_dims = act(headsup, "dims", "", checkable=True, tip="도면식 치수 표기 (D)", shortcut="D")
-    ac_dims.setChecked(True); ac_dims.toggled.connect(toggle_dims)
+    ac_dims = act(headsup, "dims", "", checkable=True,
+                  tip="도면식 치수 표기 켜기/끄기 (D) — 평소엔 마우스를 선·면에 올리면 아래에 치수가 나옵니다", shortcut="D")
+    ac_dims.setChecked(False); ac_dims.toggled.connect(toggle_dims)
     ac_box = act(headsup, "box", "", checkable=True, tip="외곽 상자 (B)", shortcut="B")
     ac_box.toggled.connect(toggle_box)
 
@@ -2305,8 +2556,8 @@ def gui_qt(a):
         scene.load(info, state["color"])
         for k, ac in sec_acts.items():
             ac.setChecked(False)
-        ac_dims.setChecked(True); ac_box.setChecked(False)
-        scene.dims_on, scene.box_on = True, False
+        ac_dims.setChecked(scene.dims_on); ac_box.setChecked(False)
+        scene.box_on = False
         scene.apply()
         _fill_info_tree(info_tree, info, note)
         tabs.setCurrentIndex(0)
