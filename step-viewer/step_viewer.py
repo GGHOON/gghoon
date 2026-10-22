@@ -459,6 +459,87 @@ def _fmt_mm(v: float) -> str:
     return t if t not in ("", "-0") else "0"
 
 
+# 구멍·축 지름 표기 색 (모델 색과 구분되는 진한 색들). 라벨 바탕·고리·지시선이 같은 색
+HOLE_COLORS = ["#1f6feb", "#2a9d3b", "#8e44ad", "#d6336c", "#0f9fb0", "#b8860b", "#5b6ee1", "#c2410c",
+               "#15803d", "#7c3aed", "#0369a1", "#be123c"]
+_DIM_META = {}  # 3D 화면별 치수 표기 상태(겹쳐 그리는 층, 구멍별 요소)
+
+
+def _ring(c, n, r, seg=72):
+    """중심 c, 축 n, 반지름 r 인 원(닫힌 선)."""
+    import numpy as np
+    import pyvista as pv
+    c, n = np.asarray(c, float), np.asarray(n, float)
+    a = np.cross(n, [0, 0, 1]) if abs(n[2]) < 0.9 else np.cross(n, [1, 0, 0])
+    a /= np.linalg.norm(a)
+    b = np.cross(n, a)
+    t = np.linspace(0, 2 * np.pi, seg + 1)
+    pts = c + r * (np.outer(np.cos(t), a) + np.outer(np.sin(t), b))
+    return pv.lines_from_points(pts)
+
+
+def _dim_overlay(pl):
+    """모델 위에 겹쳐 그리는 층(가려진 부분도 보이게). 3D 화면마다 하나 만들어 재사용한다."""
+    from vtkmodules.vtkRenderingCore import vtkRenderer
+    meta = _DIM_META.get(id(pl))
+    ov = meta["overlay"] if meta else None
+    if ov is None:
+        ov = vtkRenderer()
+        ov.SetLayer(1)
+        ov.InteractiveOff()
+        rw = pl.ren_win
+        rw.SetNumberOfLayers(max(2, rw.GetNumberOfLayers()))
+        rw.AddRenderer(ov)
+    ov.SetViewport(pl.renderer.GetViewport())
+    ov.SetActiveCamera(pl.renderer.GetActiveCamera())
+    ov.RemoveAllViewProps()
+    ov.SetDraw(True)
+    return ov
+
+
+def _overlay_add(ov, poly, color, width=1.5, opacity=1.0):
+    import pyvista as pv
+    from vtkmodules.vtkRenderingCore import vtkActor, vtkPolyDataMapper
+    mp = vtkPolyDataMapper()
+    mp.SetInputData(poly)
+    act = vtkActor()
+    act.SetMapper(mp)
+    prop = act.GetProperty()
+    prop.SetColor(pv.Color(color).float_rgb)
+    prop.SetLineWidth(width)
+    prop.SetOpacity(opacity)
+    prop.LightingOff()
+    ov.AddActor(act)
+    return act
+
+
+def set_dims_visible(pl, names, on: bool):
+    """치수 표기 전체 켜고 끄기 (보통 층 + 겹쳐 그리는 층)."""
+    for nm, act in list(pl.renderer.actors.items()):
+        if any(str(nm) == d or str(nm).startswith(d + "-") for d in names):
+            act.SetVisibility(on)
+    meta = _DIM_META.get(id(pl))
+    if meta and meta.get("overlay") is not None:
+        meta["overlay"].SetDraw(on)
+
+
+def highlight_hole(pl, idx):
+    """패널에서 고른 지름 하나만 강조(굵게·진하게), 나머지는 흐리게. idx=None 이면 원래대로."""
+    meta = _DIM_META.get(id(pl))
+    if not meta:
+        return
+    for i, h in enumerate(meta["holes"]):
+        sel = idx is None or i == idx
+        h["main"].GetProperty().SetLineWidth(6 if (idx is not None and i == idx) else 3)
+        h["main"].GetProperty().SetOpacity(1.0 if sel else 0.15)
+        h["ov_ring"].GetProperty().SetOpacity(0.8 if (idx is not None and i == idx) else (0.35 if sel else 0.05))
+        h["ov_lead"].GetProperty().SetOpacity(0.9 if sel else 0.08)
+        lab = pl.renderer.actors.get(h["label"] + "-labels")
+        if lab is not None:
+            lab.SetVisibility(sel)
+    pl.render()
+
+
 def hole_groups(info: dict, max_labels: int = 12) -> list:
     """원형 모서리에서 '구멍·축 지름' 표기 목록을 만든다. → [(지름, 개수, 중심, 축방향), ...] 큰 지름부터.
     - 반원 2개로 나뉜 모서리는 합쳐서 완전한 원만 인정(필렛 등 부분 호는 제외)
@@ -478,16 +559,19 @@ def hole_groups(info: dict, max_labels: int = 12) -> list:
         key = (round(d, 3), tuple(round(v, 3) for v in n), tuple(round(v, 2) for v in foot), round(t, 3))
         g = full.setdefault(key, {"span": 0.0, "c": (cx, cy, cz), "n": n})
         g["span"] += span
-    by_axis = {}
+    by_axis = {}   # 축선별: 그 축에 있는 같은 지름의 완전한 원 전부(구멍 양 끝 모서리 등)
     for k, g in full.items():
         if g["span"] >= 2 * math.pi - 1e-3:
-            by_axis.setdefault(k[:3], g)
+            by_axis.setdefault(k[:3], []).append(g)
     by_d = {}
-    for k, g in by_axis.items():
-        by_d.setdefault(k[0], []).append(g)
+    for k, gs in by_axis.items():
+        by_d.setdefault(k[0], []).append(gs)
     out = []
-    for d, gs in sorted(by_d.items(), key=lambda kv: -kv[0])[:max_labels]:
-        out.append((d, len(gs), gs[0]["c"], gs[0]["n"]))
+    for d, axes in sorted(by_d.items(), key=lambda kv: -kv[0])[:max_labels]:
+        rings = [(g["c"], g["n"]) for gs in axes for g in gs]
+        # 지시선은 기본 등각 시점(오른쪽 위 앞)에서 가장 앞쪽에 있는 원에서 뺀다
+        front = max(rings, key=lambda r: r[0][0] + r[0][1] + r[0][2])
+        out.append((d, len(axes), front[0], front[1], rings))
     return out
 
 
@@ -541,14 +625,22 @@ def add_dimensions(pl, info: dict) -> list:
     for i, (pt, t) in enumerate(zip(lab_pts, lab_txt)):
         label(pt, t, tcol, f"dim_label{i}")
 
-    # 구멍·축 지름: 원 위의 한 점에서 바깥쪽으로 지시선을 긋고 Ø 표기
+    # 구멍·축 지름: 가리키는 원 자체를 색깔 고리로 칠하고, 같은 색 지시선·같은 색 라벨로 연결한다.
+    # - 고리는 보이는 부분은 진하게, 모델에 가려진 부분은 연하게(겹쳐 그리는 층) → 어느 원인지 바로 보임
+    # - 같은 지름이 여러 곳이면 모든 원에 같은 색 고리 → '4×Ø5' 가 어디 어디인지 보임
+    ov = _dim_overlay(pl)
+    meta = {"overlay": ov, "holes": []}
+    _DIM_META[id(pl)] = meta
     holes = hole_groups(info)
     if holes:
-        leaders, pts, txt = [], [], []
         ctr = np.array([(x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2])
         axis_seen = {}
-        for i, (d, cnt, c, n) in enumerate(holes):
+        for i, (d, cnt, c, n, rings) in enumerate(holes):
+            colr = HOLE_COLORS[i % len(HOLE_COLORS)]
             c, n = np.array(c, float), np.array(n, float)
+            ring_poly = pv.merge([_ring(rc, rn, d / 2) for rc, rn in rings])
+            main_ring = pl.add_mesh(ring_poly, color=colr, line_width=3, name=f"hole_ring{i}", pickable=False)
+            names.append(f"hole_ring{i}")
             w = np.array([1.0, 1.0, 1.0]) + (c - ctr) / L   # 모델 바깥(오른쪽 위) 방향으로 지시선을 뺀다
             u = w - w.dot(n) * n
             if np.linalg.norm(u) < 1e-6:
@@ -562,15 +654,18 @@ def add_dimensions(pl, info: dict) -> list:
                 ang = np.radians(45.0 * k)
                 u = u * np.cos(ang) + np.cross(n, u) * np.sin(ang)
             on = c + u * d / 2                      # 원 둘레 위의 점
-            # 같은 축의 구멍들(단차 보어 등)이 겹치지 않게 지시선 길이를 조금씩 다르게
             tip = on + (u + n * 0.4) / np.linalg.norm(u + n * 0.4) * (0.16 + 0.04 * (k % 3)) * L
-            leaders.append(pv.Line(on, tip))
-            pts.append(tip)
-            txt.append((f"{cnt}×" if cnt > 1 else "") + "Ø" + _fmt_mm(d))
-        pl.add_mesh(pv.merge(leaders), color="#8a3b00", line_width=2, name="hole_leaders", pickable=False)
-        names.append("hole_leaders")
-        for i, (pt, t) in enumerate(zip(pts, txt)):
-            label(pt, t, "#8a3b00", f"hole_label{i}")
+            leader = pv.merge([pv.Line(on, tip), pv.Sphere(radius=0.008 * L, center=on)])
+            # 겹쳐 그리는 층: 가려진 고리(연하게)와 지시선(모델을 뚫고 라벨까지 이어지게)
+            ov_ring = _overlay_add(ov, ring_poly, colr, width=1.5, opacity=0.35)
+            ov_lead = _overlay_add(ov, leader, colr, width=1.5, opacity=0.9)
+            txt = (f"{cnt}×" if cnt > 1 else "") + "Ø" + _fmt_mm(d)
+            nm = f"hole_label{i}"
+            pl.add_point_labels(np.array([tip]), [txt], font_size=13, text_color="white", bold=True,
+                                shape="rounded_rect", shape_color=colr, shape_opacity=0.92, point_size=1,
+                                show_points=False, always_visible=True, name=nm)
+            names.append(nm)
+            meta["holes"].append({"main": main_ring, "ov_ring": ov_ring, "ov_lead": ov_lead, "label": nm})
     return names
 
 
@@ -671,10 +766,7 @@ def show(info: dict, png: str | None = None, color: str | None = None):
     # ---- 치수 표기: D 키로 켜고 끔 (단면 보기 중에도 그대로 보임)
     def toggle_dims():
         tools["dims"] = not tools["dims"]
-        for nm, act in list(pl.renderer.actors.items()):
-            # 라벨은 pyvista 가 '이름-labels' 처럼 뒤에 붙여 저장하므로 앞부분으로 찾는다
-            if any(str(nm) == d or str(nm).startswith(d + "-") for d in dim_names):
-                act.SetVisibility(tools["dims"])
+        set_dims_visible(pl, dim_names, tools["dims"])
         draw_status()
         pl.render()
 
@@ -1822,9 +1914,7 @@ class _Scene:
             self.edges.SetVisibility(self.style != "shaded" and self.section is None)
         self.body.SetVisibility(self.section is None)
         self.box.SetVisibility(self.box_on)
-        for nm, act in list(self.pl.renderer.actors.items()):
-            if any(str(nm) == d or str(nm).startswith(d + "-") for d in self.dim_names):
-                act.SetVisibility(self.dims_on)
+        set_dims_visible(self.pl, self.dim_names, self.dims_on)
         self.pl.render()
 
     def view(self, name):
@@ -1874,7 +1964,7 @@ class _Scene:
 
 def _fill_info_tree(tree, info, note=""):
     """솔리드웍스 FeatureManager 처럼 부품 정보를 나무 구조로 보여 준다."""
-    from qtpy import QtWidgets
+    from qtpy import QtGui, QtWidgets
     tree.clear()
     if not info:
         return
@@ -1903,13 +1993,18 @@ def _fill_info_tree(tree, info, note=""):
     holes = hole_groups(info, max_labels=50)
     if holes:
         hd = add(root, "구멍·축 지름", f"{len(holes)}종")
-        for d, cnt, _c, _n in holes:
-            add(hd, ("%d×" % cnt if cnt > 1 else "") + "Ø" + _fmt_mm(d), "")
+        for i, (d, cnt, _c, _n, _r) in enumerate(holes):
+            it = add(hd, ("%d×" % cnt if cnt > 1 else "") + "Ø" + _fmt_mm(d), "클릭하면 3D 에서 강조")
+            it.setData(0, 32, i)  # Qt.UserRole: 강조할 구멍 번호
+            pm = QtGui.QPixmap(12, 12); pm.fill(QtGui.QColor(HOLE_COLORS[i % len(HOLE_COLORS)]))
+            it.setIcon(0, QtGui.QIcon(pm))
     add(root, "작성", info.get("software") or "-")
     if note:
         add(root, "비고", note)
     tree.expandItem(root)
     tree.expandItem(size)
+    if holes:
+        tree.expandItem(hd)  # 색 견본과 함께 지름 목록을 펼쳐 둔다(누르면 3D 에서 강조)
     tree.resizeColumnToContents(0)
 
 
@@ -1984,6 +2079,13 @@ def gui_qt(a):
         hbtn.addWidget(b)
     hb.addLayout(hbtn)
     tabs.addTab(info_tree, "부품 정보")
+
+    def on_info_click(item, _col=0):
+        # '구멍·축 지름' 아래 항목을 누르면 그 지름만 3D 에서 강조, 다른 항목을 누르면 원래대로
+        idx = item.data(0, 32)
+        highlight_hole(pl, idx if isinstance(idx, int) else None)
+
+    info_tree.itemClicked.connect(on_info_click)
     tabs.addTab(hist_box, "이전 기록")
     pv_l.addWidget(tabs, 1)
     # 설정 영역
