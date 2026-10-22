@@ -36,7 +36,9 @@ echo [2/5] 묶는 중... (5~15분 걸릴 수 있습니다)
   --hidden-import vtkmodules.vtkIOXML --hidden-import vtkmodules.vtkIOGeometry ^
   --hidden-import vtkmodules.vtkFiltersCore --hidden-import vtkmodules.vtkFiltersGeneral ^
   --hidden-import vtkmodules.vtkFiltersSources --hidden-import vtkmodules.vtkRenderingUI ^
-  --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --hidden-import pyvistaqt --hidden-import qtpy ^
+  --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --collect-submodules pyvistaqt --collect-submodules qtpy ^
+  --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import PySide6.QtWidgets ^
+  --hidden-import PySide6.QtOpenGL --hidden-import PySide6.QtOpenGLWidgets --hidden-import PySide6.QtTest ^
   --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 ^
   --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtNetwork ^
   --exclude-module PySide6.QtPdf --exclude-module PySide6.QtSvg ^

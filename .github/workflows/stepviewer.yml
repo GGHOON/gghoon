@@ -39,7 +39,7 @@ jobs:
         run: |
           python step_viewer.py --selftest --no-render
           $code = $LASTEXITCODE
-          Get-Content step_selftest.log | ForEach-Object { if ($code -ne 0) { "::error::$_" } else { $_ } }
+          if ($code -ne 0) { Get-Content step_selftest.log -Tail 8 | ForEach-Object { "::error::$_" } } else { Get-Content step_selftest.log }
           exit $code
 
       - name: Build exe (PyInstaller)
@@ -51,7 +51,9 @@ jobs:
             --hidden-import vtkmodules.vtkIOXML --hidden-import vtkmodules.vtkIOGeometry `
             --hidden-import vtkmodules.vtkFiltersCore --hidden-import vtkmodules.vtkFiltersGeneral `
             --hidden-import vtkmodules.vtkFiltersSources --hidden-import vtkmodules.vtkRenderingUI `
-            --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --hidden-import pyvistaqt --hidden-import qtpy `
+            --hidden-import vtkmodules.qt.QVTKRenderWindowInteractor --collect-submodules pyvistaqt --collect-submodules qtpy `
+            --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui --hidden-import PySide6.QtWidgets `
+            --hidden-import PySide6.QtOpenGL --hidden-import PySide6.QtOpenGLWidgets --hidden-import PySide6.QtTest `
             --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module PySide2 `
             --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick --exclude-module PySide6.QtNetwork `
             --exclude-module PySide6.QtPdf --exclude-module PySide6.QtSvg `
@@ -79,7 +81,7 @@ jobs:
             python prune_vtk.py dist/STEPViewer --restore
             $code = Run-Test
             if ($code -ne 0) {
-              Get-Content dist/STEPViewer/step_selftest.log | ForEach-Object { "::error::$_" }
+              Get-Content dist/STEPViewer/step_selftest.log -Tail 8 | ForEach-Object { "::error::$_" }
               exit 1
             }
           }
