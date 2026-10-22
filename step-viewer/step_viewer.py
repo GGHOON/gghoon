@@ -1012,6 +1012,14 @@ def grab_text_via_notepad(path, tk_root, log=lambda m: None, backend=None, timeo
         backend.close(hwnd)
 
 
+def read_step_via_notepad(p: Path, clip, log=lambda m: None) -> str:
+    """STEP 파일 내용은 항상 '메모장으로 열어 내용을 가져오는' 방식으로 읽는다(처음 정한 방식).
+    로컬 파일도 같은 방식. 윈도우가 아닌 환경(개발·자동 점검)에서만 직접 읽는다."""
+    if sys.platform != "win32":
+        return Path(p).read_bytes().decode("utf-8", errors="replace")
+    return grab_text_via_notepad(p, clip, log)
+
+
 # ---------------------------------------------------------------- 기록 저장
 HIST_DIR = APP_DIR / "step_history"
 HIST_INDEX = HIST_DIR / "history.json"
@@ -1504,15 +1512,7 @@ def gui(a):
         poll()
 
     def read_step_file(p: Path) -> str:
-        """먼저 파이썬으로 직접 읽어 보고(로컬 파일), 막혀 있으면(문서중앙화 드라이브 등) 메모장 방식으로 가져온다."""
-        try:
-            raw = p.read_bytes()
-            text = raw.decode("utf-8", errors="replace")
-            if text.lstrip("\ufeff \t\r\n").upper().startswith("ISO-10303-21"):
-                return text
-        except OSError:
-            pass
-        return grab_text_via_notepad(p, root, set_out)
+        return read_step_via_notepad(p, root, set_out)
 
     def open_path(p: Path):
         if wk["busy"]:
@@ -2306,13 +2306,7 @@ def gui_qt(a):
         timer.start(150)
 
     def read_step_file(p: Path) -> str:
-        try:
-            text = p.read_bytes().decode("utf-8", errors="replace")
-            if text.lstrip("﻿ \t\r\n").upper().startswith("ISO-10303-21"):
-                return text
-        except OSError:
-            pass
-        return grab_text_via_notepad(p, _QtClipboard(app), say)
+        return read_step_via_notepad(p, _QtClipboard(app), say)
 
     def open_path(p: Path):
         if wk["busy"]:
