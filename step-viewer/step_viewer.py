@@ -2276,7 +2276,7 @@ def gui_qt(a):
     dens_edit.setPlaceholderText("파일에 밀도가 없을 때만 사용 (예: 7.85)")
     form.addRow("밀도 g/cm³", dens_edit)
     hint = QtWidgets.QLabel("마우스를 선·호·면에 올리면 아래에 치수가 나옵니다.\n"
-                            "M 거리 측정: 점 두 개 클릭 → 거리 (원은 중심에 붙음, Esc 지우기)\n"
+                            "M 거리 측정: 요소 두 개 클릭 (선↔선 평행거리·각도, 원↔원 중심선 거리, 면↔면, Esc 지우기)\n"
                             "마우스: 왼쪽 드래그 회전 · 휠 확대 · Shift+드래그 이동\n"
                             "단축키: Space 자동회전 · V 정면 · T 윗면 · I 등각 · X 단면 · D 치수표기 · B 상자")
     hint.setObjectName("hint"); hint.setWordWrap(True)
@@ -2307,7 +2307,7 @@ def gui_qt(a):
     import numpy as _np
     from vtkmodules.vtkRenderingCore import vtkCellPicker
 
-    hov = {"picker": vtkCellPicker(), "last": 0.0, "hl": None, "txt": ""}
+    hov = {"picker": vtkCellPicker(), "last": 0.0, "hl": None, "txt": "", "key": None}
     hov["picker"].SetTolerance(0.0008)
 
     def _clear_hover_hl():
@@ -2333,8 +2333,11 @@ def gui_qt(a):
         A, B, E = _edge_segments(feat)
         if not len(A):
             return None
-        D = B - A
-        t = _np.clip(_np.einsum("ij,ij->i", world - A, D) / _np.maximum(_np.einsum("ij,ij->i", D, D), 1e-30), 0, 1)
+        if "_segD" not in feat:   # 선분 방향·길이² 는 한 번만 계산
+            feat["_segD"] = B - A
+            feat["_segDD"] = _np.maximum(_np.einsum("ij,ij->i", feat["_segD"], feat["_segD"]), 1e-30)
+        D = feat["_segD"]
+        t = _np.clip(_np.einsum("ij,ij->i", world - A, D) / feat["_segDD"], 0, 1)
         Q = A + D * t[:, None]
         dq = _np.einsum("ij,ij->i", Q - world, Q - world)
         k = int(_np.argmin(dq))
@@ -2356,43 +2359,46 @@ def gui_qt(a):
         if now - hov["last"] < 0.03:   # 너무 자주 계산하지 않도록
             return
         hov["last"] = now
+        import pyvista as pv
         feat = scene.feat
-        iren = pl.iren.interactor
-        x, y = iren.GetEventPosition()
-        pk = hov["picker"]
-        if not pk.Pick(x, y, 0, pl.renderer) or pk.GetActor() is not scene.body:
-            if hov["txt"]:
-                hov["txt"] = ""
-                hover_lbl.setText("")
-                _clear_hover_hl()
-                pl.render()
-            return
-        world = _np.array(pk.GetPickPosition(), float)
-        txt, hl_pts = "", None
-        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
-        # 1) 가까운 모서리(선/호/원)인가? (화면에서 약 7픽셀 이내)
-        ne = _nearest_edge(feat, world)
-        if ne is not None and ne[1] < max(_px_world(world, 7), diag * 1e-4):
-            ei = ne[0]
-            txt = feat["edge_text"][ei]
-            hl_pts = feat["edge_pts"][feat["edge_idx"] == ei]
-        # 2) 아니면 올린 면의 치수
-        if not txt and feat:
-            try:
-                fid = int(scene.mesh.cell_data["face_id"][pk.GetCellId()])
-                txt = feat["face_text"][fid]
-            except Exception:
-                txt = ""
-        if txt != hov["txt"]:
-            hov["txt"] = txt
+        x, y = pl.iren.interactor.GetEventPosition()
+        key, txt, hl_pts, hl_face = None, "", None, None
+        if meas["on"]:
+            # 측정 모드: 클릭하면 선택될 요소를 미리 주황색으로 보여 줌
+            e = _entity_at(x, y)
+            if e is not None:
+                key, txt, hl_pts, hl_face = e["key"], "→ " + e["name"], e.get("hl_pts"), e.get("hl_face")
+        else:
+            pk = hov["picker"]
+            if pk.Pick(x, y, 0, pl.renderer) and pk.GetActor() is scene.body:
+                world = _np.array(pk.GetPickPosition(), float)
+                diag = _diag()
+                ne = _nearest_edge(feat, world)   # 1) 가까운 모서리(선/호/원)인가? (화면 약 7픽셀 이내)
+                if ne is not None and ne[1] < max(_px_world(world, 7), diag * 1e-4):
+                    key, txt = ("e", ne[0]), feat["edge_text"][ne[0]]
+                    hl_pts = feat["edge_pts"][feat["edge_idx"] == ne[0]]
+                elif feat:                         # 2) 아니면 올린 면의 치수
+                    try:
+                        fid = int(scene.mesh.cell_data["face_id"][pk.GetCellId()])
+                        key, txt = ("f", fid), feat["face_text"][fid]
+                    except Exception:
+                        pass
+        if key != hov.get("key"):
+            hov["key"] = key
             if txt:
                 status.clearMessage()   # 임시 안내 문구가 이 칸을 가리지 않게
             hover_lbl.setText(("  " + txt) if txt else "")
             _clear_hover_hl()
             if hl_pts is not None and len(hl_pts) > 1:
-                import pyvista as pv
                 hov["hl"] = pl.add_mesh(pv.lines_from_points(hl_pts), color="#ff6a00", line_width=5,
                                         name="hover_hl", pickable=False)
+            elif hl_face is not None:
+                try:
+                    hov["hl"] = pl.add_mesh(_face_mesh(hl_face), color="#ff6a00", opacity=0.4,
+                                            name="hover_hl", pickable=False)
+                    _pull_front(hov["hl"])
+                except Exception:
+                    pass
             pl.render()
 
     try:
@@ -2478,70 +2484,260 @@ def gui_qt(a):
     ac_box = act(headsup, "box", "", checkable=True, tip="외곽 상자 (B)", shortcut="B")
     ac_box.toggled.connect(toggle_box)
 
-    # ---- 두 점 거리 측정 (M): 측정 모드에서 클릭 두 번 → 두 점 사이 거리와 ΔX/ΔY/ΔZ
-    # 클릭 위치가 꼭짓점·원(호) 모서리·모서리 근처면 그 점(원은 중심)에 맞춰 붙고, 아니면 면 위의 점.
-    # 드래그(회전)와 구분하려고 누른 자리와 뗀 자리가 거의 같을 때만 점으로 인정.
-    meas = {"on": False, "pts": [], "names": [], "down": None, "picker": vtkCellPicker()}
+    # ---- 요소 간 거리 측정 (M) — 오토캐드/솔리드웍스 측정 방식
+    # 측정 모드에서 '요소'를 두 개 차례로 클릭하면 두 요소 사이 거리를 잰다.
+    #   요소 종류: 직선 모서리(선) · 원/호 모서리(→ 중심선) · 원통면(→ 중심선) · 평면 · 꼭짓점 · 그 밖은 클릭한 점
+    #   선↔선: 평행이면 수직 거리, 아니면 사잇각(+최소 거리)      원/호↔원/호: 중심선 간 거리 (+ 중심 간 거리)
+    #   선↔원: 원 중심(중심선)에서 선까지 수직 거리             평면↔평면: 평행이면 면 간 거리, 아니면 사잇각
+    #   선↔평면: 평행이면 거리, 아니면 사잇각                    원↔평면: 원 중심에서 평면까지 거리
+    # 드래그(회전)와 구분하려고 누른 자리와 뗀 자리가 거의 같을 때만 클릭으로 인정.
+    MC = "#d6006f"      # 선택한 요소·치수선 색
+    meas = {"on": False, "sel": [], "names": [], "down": None, "picker": vtkCellPicker(), "ov": None}
     meas["picker"].SetTolerance(0.0008)
     meas_lbl = QtWidgets.QLabel("")
     meas_lbl.setStyleSheet("QLabel { color: #a3004f; font-weight: 700; padding: 0 8px; }")
     status.addWidget(meas_lbl)
+    PAR = 1e-5          # 평행 판정 (약 0.25°)
 
-    def _circle_center(P3):
-        a, b, c = (_np.asarray(v, float) for v in P3)
+    def _unit(v):
+        n = float(_np.linalg.norm(v))
+        return v / n if n > 1e-15 else v
+
+    def _diag():
+        return float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
+
+    def _circle_of(ep):
+        """원/호 표본점 → (중심, 축 방향)"""
+        m = len(ep) - 1
+        a, b, c = ep[0], ep[max(1, m // 3)], ep[max(2, (2 * m) // 3)]
         ab, ac = b - a, c - a
         n = _np.cross(ab, ac)
         nn = float(n @ n)
-        if nn < 1e-18:
-            return None
-        return a + (_np.cross(n, ab) * float(ac @ ac) + _np.cross(ac, n) * float(ab @ ab)) / (2 * nn)
+        if nn < 1e-24:
+            return None, None
+        ctr = a + (_np.cross(n, ab) * float(ac @ ac) + _np.cross(ac, n) * float(ab @ ab)) / (2 * nn)
+        return ctr, _unit(n)
 
-    def _snap(world, cid, actor):
-        """클릭한 자리 → (점, 종류 설명, 평면이면 법선)"""
+    def _face_cells(feat, fid):
+        """면 번호 → 그 면의 삼각형 번호들 (한 번 정렬해 두고 빠르게 꺼냄)"""
+        if "_forder" not in feat:
+            f = _np.asarray(scene.mesh.cell_data["face_id"])
+            o = _np.argsort(f, kind="stable")
+            feat["_forder"] = o
+            feat["_fstart"] = _np.searchsorted(f[o], _np.arange(len(feat["face_text"]) + 1))
+        return feat["_forder"][feat["_fstart"][fid]:feat["_fstart"][fid + 1]]
+
+    def _tris():
+        if scene.feat is not None and "_tris" in scene.feat:
+            return scene.feat["_tris"]
+        t = _np.asarray(scene.mesh.faces).reshape(-1, 4)[:, 1:]
+        if scene.feat is not None:
+            scene.feat["_tris"] = t
+        return t
+
+    def _cyl_axis(cells):
+        """원통면 삼각형들 → (축 위 한 점, 축 방향, 면 꼭짓점들). 삼각형 법선은 축에 수직이라는 성질로 축을 찾고,
+        축에 수직인 평면에 꼭짓점을 투영해 원을 맞춰 중심을 구한다."""
+        T = _tris()[cells]
+        P = _np.asarray(scene.mesh.points, float)
+        a, b, c = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+        N = _np.cross(b - a, c - a)
+        N = N / _np.maximum(_np.linalg.norm(N, axis=1, keepdims=True), 1e-30)
+        w, V = _np.linalg.eigh(N.T @ N)
+        if w[1] < 1e-3 * max(w[2], 1e-30):     # 너무 좁은 조각이라 축을 정할 수 없음
+            return None
+        ax = V[:, 0]
+        pts = P[_np.unique(T)]
+        u = _unit(_np.cross(ax, [1, 0, 0] if abs(ax[0]) < 0.9 else [0, 1, 0]))
+        v = _np.cross(ax, u)
+        o = pts.mean(0)
+        X, Y = (pts - o) @ u, (pts - o) @ v
+        A = _np.c_[2 * X, 2 * Y, _np.ones_like(X)]
+        try:
+            sol = _np.linalg.lstsq(A, X * X + Y * Y, rcond=None)[0]
+        except Exception:
+            return None
+        return o + sol[0] * u + sol[1] * v, ax, pts
+
+    def _entity_at(x, y):
+        """화면 (x, y) 아래의 측정 요소. None = 모델 밖."""
         feat = scene.feat
-        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
-        tol = max(_px_world(world, 7), diag * 1e-4)      # 모서리에 붙는 범위: 화면 약 7픽셀
-        vtol = max(_px_world(world, 10), diag * 1e-4)    # 꼭짓점에 붙는 범위: 화면 약 10픽셀
-        normal = None
-        if feat and actor is scene.body and cid >= 0:
-            try:
-                fid = int(scene.mesh.cell_data["face_id"][cid])
-                if feat["face_text"][fid].startswith("평면"):
-                    cp = scene.mesh.get_cell(cid).points
-                    n = _np.cross(cp[1] - cp[0], cp[2] - cp[0])
-                    normal = n / (_np.linalg.norm(n) or 1.0)
-            except Exception:
-                normal = None
+        pk = meas["picker"]
+        if scene.body is None or not pk.Pick(x, y, 0, pl.renderer) or pk.GetActor() is None:
+            return None
+        world = _np.array(pk.GetPickPosition(), float)
+        diag = _diag()
+        tol = max(_px_world(world, 7), diag * 1e-4)
         if feat and len(feat["edge_pts"]):
-            # 꼭짓점(원이 아닌 모서리의 끝점)이 가까우면 우선
-            A, B, E = _edge_segments(feat)
+            ne = _nearest_edge(feat, world)
             if "_verts" not in feat:
                 vs = [feat["edge_pts"][feat["edge_idx"] == ei][[0, -1]].astype(float)
                       for ei, t in enumerate(feat["edge_text"]) if not t.startswith("원")]
                 feat["_verts"] = _np.vstack(vs) if vs else _np.zeros((0, 3))
             V = feat["_verts"]
-            ne = _nearest_edge(feat, world)
-            near_circle = ne is not None and ne[1] < tol and feat["edge_text"][ne[0]][:1] in ("원", "호")
-            if len(V):
+            on_edge = ne is not None and ne[1] < tol
+            et0 = feat["edge_text"][ne[0]] if on_edge else ""
+            # 꼭짓점 바로 위면 꼭짓점. 단, 원 위를 찍었으면 원이 우선(작은 구멍의 이음매 꼭짓점에 잘못 붙지 않게)
+            vpx = 0 if et0.startswith("원") else (2.5 if et0.startswith("호") else 4)
+            if len(V) and vpx:
                 dv = _np.einsum("ij,ij->i", V - world, V - world)
                 k = int(_np.argmin(dv))
-                # 원·호 위를 찍었으면 중심이 우선 (작은 구멍의 이음매 꼭짓점에 잘못 붙지 않게), 꼭짓점 바로 위면 꼭짓점
-                if dv[k] ** 0.5 < (max(_px_world(world, 3), diag * 1e-4) if near_circle else vtol):
-                    return V[k], "꼭짓점", None
-            if ne is not None and ne[1] < tol:
-                ei, _dist, q = ne
+                if dv[k] ** 0.5 < max(_px_world(world, vpx), diag * 1e-4):
+                    p = V[k]
+                    return {"key": ("v", round(p[0], 6), round(p[1], 6), round(p[2], 6)), "kind": "point", "p": p,
+                            "name": "꼭짓점", "hl_pts": None, "hl_face": None, "pick": p}
+            if on_edge:
+                ei = ne[0]
                 ep = feat["edge_pts"][feat["edge_idx"] == ei].astype(float)
                 et = feat["edge_text"][ei]
-                if et.startswith("원") or et.startswith("호"):     # 원·호 → 중심
-                    m = len(ep) - 1
-                    c = _circle_center((ep[0], ep[m // 3], ep[(2 * m) // 3]))
+                base = {"key": ("e", ei), "hl_pts": ep, "hl_face": None, "pick": ne[2]}
+                if et.startswith("직선"):
+                    d = ep[-1] - ep[0]
+                    return dict(base, kind="line", p=ep[0], d=_unit(d), a=ep[0], b=ep[-1], name=et)
+                if et.startswith("원") or et.startswith("호"):
+                    c, n = _circle_of(ep)
                     if c is not None:
-                        return c, et.split("  ")[0] + " 중심 (" + et.split("  ", 1)[-1] + ")", None
-                return q, "모서리 위 점", None
-        return world, ("평면 위 점" if normal is not None else "면 위 점"), normal
+                        r = float(_np.linalg.norm(ep[0] - c))
+                        return dict(base, kind="axis", p=c, d=n, c=c, r=r, circle=True, name=et + " (중심선)")
+                return dict(base, kind="point", p=ne[2], name=et + " 위 점")
+        # 면
+        name, hl_face, cid = "면 위 점", None, pk.GetCellId()
+        if feat and pk.GetActor() is scene.body and cid >= 0:
+            try:
+                fid = int(scene.mesh.cell_data["face_id"][cid])
+                ft = feat["face_text"][fid]
+                hl_face = fid
+                if ft.startswith("평면"):
+                    T = _tris()[cid]
+                    P = _np.asarray(scene.mesh.points, float)[T]
+                    n = _unit(_np.cross(P[1] - P[0], P[2] - P[0]))
+                    return {"key": ("f", fid), "kind": "plane", "p": world, "n": n, "name": "평면",
+                            "hl_pts": None, "hl_face": fid, "pick": world}
+                if ft.startswith("원통면"):
+                    if "_cyl" not in feat:
+                        feat["_cyl"] = {}
+                    if fid not in feat["_cyl"]:
+                        feat["_cyl"][fid] = _cyl_axis(_face_cells(feat, fid))
+                    cy = feat["_cyl"][fid]
+                    if cy is not None:
+                        o, ax, fp = cy
+                        c = o + ax * float((world - o) @ ax)       # 클릭한 높이의 축 위 점
+                        t = (fp - o) @ ax
+                        return {"key": ("f", fid), "kind": "axis", "p": c, "d": ax, "c": c, "circle": False,
+                                "span": (o + ax * t.min(), o + ax * t.max()), "name": ft + " (중심선)",
+                                "hl_pts": None, "hl_face": fid, "pick": world}
+                name = ft + " 위 점"
+            except Exception:
+                pass
+        return {"key": ("p", round(world[0], 4), round(world[1], 4), round(world[2], 4)), "kind": "point", "p": world,
+                "name": name, "hl_pts": None, "hl_face": None, "pick": world}
 
+    # --- 두 요소 사이 측정 계산 → (주 결과, 부가 설명, 치수선 (p, q) 또는 None, 라벨 위치)
+    def _foot_line(p, a, d):
+        return a + d * float((p - a) @ d)
+
+    def _ref(e):
+        """요소의 대표점: 선은 중점, 원은 중심, 평면/점은 클릭한 점"""
+        if e["kind"] == "line":
+            return (e["a"] + e["b"]) / 2
+        if e["kind"] == "axis":
+            return e["c"]
+        return e["p"]
+
+    def _measure(A, B):
+        F = _fmt_mm
+        ka, kb = A["kind"], B["kind"]
+        order = {"point": 0, "line": 1, "axis": 1, "plane": 2}
+        if order[ka] > order[kb]:
+            A, B, ka, kb = B, A, kb, ka
+        pa, pb = _ref(A), _ref(B)
+        if A["key"] == B["key"]:
+            return A["name"], "같은 요소를 두 번 선택했습니다", None, pa
+        # 점 ↔ 점
+        if ka == "point" and kb == "point":
+            return f"거리 {F(float(_np.linalg.norm(pb - pa)))} mm", "", (pa, pb), (pa + pb) / 2
+        # 점 ↔ 선/중심선
+        if ka == "point" and kb in ("line", "axis"):
+            q = _foot_line(pa, B["p"], B["d"])
+            dl = float(_np.linalg.norm(pa - q))
+            if B.get("circle"):
+                dc = float(_np.linalg.norm(pa - B["c"]))
+                return (f"원 중심까지 {F(dc)} mm", f"중심선까지 수직 거리 {F(dl)} mm", (pa, B["c"]),
+                        (pa + B["c"]) / 2)
+            return f"수직 거리 {F(dl)} mm", ("직선(연장선)까지" if kb == "line" else "중심선까지"), (pa, q), (pa + q) / 2
+        # 점 ↔ 평면
+        if ka == "point" and kb == "plane":
+            s = float((pa - B["p"]) @ B["n"])
+            q = pa - B["n"] * s
+            return f"평면까지 수직 거리 {F(abs(s))} mm", "", (pa, q), (pa + q) / 2
+        # 선/중심선 ↔ 선/중심선
+        if ka in ("line", "axis") and kb in ("line", "axis"):
+            da, db = A["d"], B["d"]
+            cos = abs(float(da @ db))
+            ca, cb = A.get("circle"), B.get("circle")
+            if 1 - cos < PAR:   # 평행
+                q = _foot_line(pa, B["p"], db)
+                dl = float(_np.linalg.norm(pa - q))
+                if ca and cb:
+                    dc = float(_np.linalg.norm(A["c"] - B["c"]))
+                    if dl < 1e-6:
+                        return (f"동축 (중심선 일치) · 중심 간 거리 {F(dc)} mm", "두 원이 같은 중심선 위", (A["c"], B["c"]),
+                                (A["c"] + B["c"]) / 2)
+                    return (f"중심선 간 거리 {F(dl)} mm", (f"중심 간 직선 거리 {F(dc)} mm" if abs(dc - dl) > 1e-4 else ""),
+                            (pa, q), (pa + q) / 2)
+                if dl < 1e-6 and ka == "axis" and kb == "axis":
+                    return "동축 (중심선 일치)", "중심선 간 거리 0 mm", None, (pa + pb) / 2
+                what = "중심선 간 거리" if (ka == "axis" and kb == "axis") else (
+                    "중심선 ↔ 직선 거리" if "axis" in (ka, kb) else "평행 · 선 간 거리")
+                return f"{what} {F(dl)} mm", ("동일 선상" if dl < 1e-6 else ""), (pa, q), (pa + q) / 2
+            ang = float(_np.degrees(_np.arccos(min(1.0, cos))))
+            # 원(중심) ↔ 직선 이 평행하지 않으면 원 중심에서 직선까지 수직 거리
+            if (ca and kb == "line") or (cb and ka == "line"):
+                C, L = (A, B) if ca else (B, A)
+                q = _foot_line(C["c"], L["p"], L["d"])
+                return (f"원 중심 → 직선 수직 거리 {F(float(_np.linalg.norm(C['c'] - q)))} mm",
+                        f"중심선과 직선 사잇각 {ang:.2f}°", (C["c"], q), (C["c"] + q) / 2)
+            if ca and cb:
+                dc = float(_np.linalg.norm(A["c"] - B["c"]))
+                return f"중심 간 거리 {F(dc)} mm", f"두 중심선 사잇각 {ang:.2f}°", (A["c"], B["c"]), (A["c"] + B["c"]) / 2
+            # 일반 두 직선: 사잇각 + 최소 거리 (연장선 기준)
+            w0 = A["p"] - B["p"]
+            a_, b_, c_ = float(da @ da), float(da @ db), float(db @ db)
+            d_, e_ = float(da @ w0), float(db @ w0)
+            den = a_ * c_ - b_ * b_
+            s = (b_ * e_ - c_ * d_) / den
+            t = (a_ * e_ - b_ * d_) / den
+            p1, p2 = A["p"] + da * s, B["p"] + db * t
+            dmin = float(_np.linalg.norm(p1 - p2))
+            sub = "두 선이 만남 (연장선 기준)" if dmin < 1e-6 else f"최소 거리 {F(dmin)} mm (연장선 기준)"
+            return f"사잇각 {ang:.2f}°", sub, ((p1, p2) if dmin >= 1e-6 else None), (p1 + p2) / 2
+        # 선/중심선 ↔ 평면
+        if ka in ("line", "axis") and kb == "plane":
+            n = B["n"]
+            sdist = float((pa - B["p"]) @ n)
+            q = pa - n * sdist
+            if A.get("circle"):
+                return (f"원 중심 → 평면 거리 {F(abs(sdist))} mm", "", (pa, q), (pa + q) / 2)
+            sin = abs(float(A["d"] @ n))
+            if sin < (2 * PAR) ** 0.5:   # 선이 평면과 평행
+                what = "중심선 ↔ 평면 거리" if ka == "axis" else "평행 · 선 ↔ 평면 거리"
+                return f"{what} {F(abs(sdist))} mm", "", (pa, q), (pa + q) / 2
+            ang = float(_np.degrees(_np.arcsin(min(1.0, sin))))
+            return f"선 ↔ 평면 사잇각 {ang:.2f}°", f"선 대표점에서 평면까지 {F(abs(sdist))} mm", (pa, q), (pa + q) / 2
+        # 평면 ↔ 평면
+        na, nb = A["n"], B["n"]
+        cos = abs(float(na @ nb))
+        if 1 - cos < PAR:   # 두 번째로 찍은 자리에서 첫 번째 평면으로 수선 (보통 재료 밖 허공으로 그려짐)
+            sdist = float((pb - A["p"]) @ na)
+            q = pb - na * sdist
+            return f"평행 · 면 간 거리 {F(abs(sdist))} mm", ("같은 평면" if abs(sdist) < 1e-6 else ""), (pb, q), (pb + q) / 2
+        ang = float(_np.degrees(_np.arccos(min(1.0, cos))))
+        return (f"두 평면 사잇각 {ang:.2f}°", (f"보각 {180 - ang:.2f}°" if abs(ang - 90) > 0.005 else "직각"),
+                None, (pa + pb) / 2)
+
+    # --- 그리기
     def _meas_overlay():
-        """측정 점·선을 모델 위에 한 번 더 연하게 그리는 층 (구멍 안쪽 중심처럼 가려진 점도 보이게)"""
+        """측정 표시를 모델 위에 한 번 더 연하게 그리는 층 (구멍 안쪽 중심처럼 가려진 부분도 보이게)"""
         from vtkmodules.vtkRenderingCore import vtkRenderer
         ov = meas.get("ov")
         if ov is None:
@@ -2562,57 +2758,108 @@ def gui_qt(a):
                 pass
         if meas.get("ov") is not None:
             meas["ov"].RemoveAllViewProps()
-        meas["names"], meas["pts"] = [], []
+        meas["names"], meas["sel"] = [], []
         meas_lbl.setText("")
         if render:
             pl.render()
 
-    def _meas_add(mesh, **kw):
-        nm = kw.pop("name")
+    def _meas_add(mesh, overlay=True, **kw):
+        nm = f"meas_{len(meas['names'])}"
         pl.add_mesh(mesh, name=nm, pickable=False, **kw)
         meas["names"].append(nm)
-        try:   # 가려진 부분은 연하게
-            _overlay_add(_meas_overlay(), mesh, kw.get("color", "#d6006f"), kw.get("line_width", 1.5), 0.45)
+        if overlay:
+            try:   # 가려진 부분은 연하게
+                _overlay_add(_meas_overlay(), mesh, kw.get("color", MC), kw.get("line_width", 1.5), 0.45)
+            except Exception:
+                pass
+
+    def _dashes(p, q, n=14):
+        """p→q 점선(중심선 표시용)"""
+        import pyvista as pv
+        t = _np.linspace(0, 1, 2 * n + 1)
+        pts = p[None, :] + (q - p)[None, :] * t[:, None]
+        lines = _np.hstack([[2, 2 * i, 2 * i + 1] for i in range(n)])
+        return pv.PolyData(pts, lines=lines)
+
+    def _pull_front(actor):
+        """모델 면과 같은 자리에 겹쳐 그리는 강조 면이 모델에 묻혀 안 보이지 않도록 살짝 앞으로 당겨 그림"""
+        try:
+            m = actor.GetMapper()
+            m.SetResolveCoincidentTopologyToPolygonOffset()
+            m.SetRelativeCoincidentTopologyPolygonOffsetParameters(-3, -3)
+        except Exception:
+            pass
+
+    def _face_mesh(fid):
+        return scene.mesh.extract_cells(_face_cells(scene.feat, fid))
+
+    def _draw_entity(e):
+        import pyvista as pv
+        diag = _diag()
+        if e.get("hl_pts") is not None and len(e["hl_pts"]) > 1:
+            _meas_add(pv.lines_from_points(e["hl_pts"]), color=MC, line_width=5)
+        if e.get("hl_face") is not None:
+            _meas_add(_face_mesh(e["hl_face"]), overlay=False, color=MC, opacity=0.45)
+            _pull_front(pl.renderer.actors.get(meas["names"][-1]))
+        if e["kind"] == "axis":         # 중심선 (점선)
+            if e.get("span") is not None:
+                a, b = e["span"]
+                ext = 0.15 * float(_np.linalg.norm(b - a)) + diag * 0.01
+                a, b = a - e["d"] * ext, b + e["d"] * ext
+            else:
+                L = max(e["r"] * 1.5, diag * 0.04)
+                a, b = e["c"] - e["d"] * L, e["c"] + e["d"] * L
+            _meas_add(_dashes(a, b), color=MC, line_width=2)
+            _meas_add(pv.Sphere(radius=diag * 0.004, center=e["c"]), color=MC)
+        elif e["kind"] == "point":
+            _meas_add(pv.Sphere(radius=diag * 0.005, center=e["p"]), color=MC)
+
+    def _draw_result(seg, lab, main):
+        import pyvista as pv
+        diag = _diag()
+        if seg is not None:
+            p, q = seg
+            if float(_np.linalg.norm(q - p)) > 1e-9:
+                _meas_add(pv.Line(p, q), color=MC, line_width=3)
+                for s in (p, q):
+                    _meas_add(pv.Sphere(radius=diag * 0.003, center=s), color=MC)
+            # 선 위에 떨어진 발이 선분 밖이면 연장선(얇게) 표시
+            for e in meas["sel"]:
+                if e["kind"] == "line":
+                    for s in (p, q):
+                        t = float((s - e["a"]) @ e["d"])
+                        Ln = float(_np.linalg.norm(e["b"] - e["a"]))
+                        if abs(float(_np.linalg.norm(s - (e["a"] + e["d"] * t)))) < 1e-6 and (t < -1e-6 or t > Ln + 1e-6):
+                            end = e["a"] if t < 0 else e["b"]
+                            _meas_add(_dashes(end, s, 6), color="#7a7a80", line_width=1)
+        try:
+            pl.add_point_labels([lab], [main], name="meas_text", font_size=15, bold=True,
+                                text_color="#ffffff", shape_color=MC, shape_opacity=0.9,
+                                point_size=0, show_points=False, always_visible=True, pickable=False)
+            meas["names"].append("meas_text")
         except Exception:
             pass
 
     def meas_pick(x, y):
-        import pyvista as pv
-        if scene.body is None:
+        e = _entity_at(x, y)
+        if e is None:
             return
-        pk = meas["picker"]
-        if not pk.Pick(x, y, 0, pl.renderer) or pk.GetActor() is None:
-            return
-        world = _np.array(pk.GetPickPosition(), float)
-        p, kind, nrm = _snap(world, pk.GetCellId(), pk.GetActor())
-        if len(meas["pts"]) >= 2:          # 세 번째 클릭 → 새 측정 시작
+        if len(meas["sel"]) >= 2:          # 세 번째 클릭 → 새 측정 시작
             meas_clear(render=False)
-        meas["pts"].append((p, kind, nrm))
-        diag = float(_np.linalg.norm(_np.array(scene.mesh.bounds[1::2]) - _np.array(scene.mesh.bounds[::2]))) or 1.0
-        i = len(meas["pts"])
-        _meas_add(pv.Sphere(radius=diag * 0.006, center=p), color="#d6006f", name=f"meas_p{i}")
-        if i == 1:
-            status.clearMessage()
-            meas_lbl.setText(f"  점1: {kind}  → 두 번째 점을 클릭하세요")
+        meas["sel"].append(e)
+        _draw_entity(e)
+        status.clearMessage()
+        if len(meas["sel"]) == 1:
+            meas_lbl.setText(f"  ① {e['name']}  선택  → 두 번째 요소(선·원·호·면·꼭짓점)를 클릭하세요")
         else:
-            (p1, k1, n1), (p2, k2, n2) = meas["pts"]
-            d = p2 - p1
-            L = float(_np.linalg.norm(d))
-            _meas_add(pv.Line(p1, p2), color="#d6006f", line_width=3, name="meas_line")
-            txt = f"거리 {_fmt_mm(L)} mm"
-            extra = ""
-            if n1 is not None and n2 is not None and abs(float(n1 @ n2)) > 0.9999:   # 두 평행 평면
-                extra = f"   ·   평행면 간 거리 {_fmt_mm(abs(float(d @ n1)))}"
-            try:
-                pl.add_point_labels([(p1 + p2) / 2], [txt], name="meas_text", font_size=15, bold=True,
-                                    text_color="#ffffff", shape_color="#d6006f", shape_opacity=0.9,
-                                    point_size=0, show_points=False, always_visible=True, pickable=False)
-                meas["names"].append("meas_text")
-            except Exception:
-                pass
-            status.clearMessage()
-            meas_lbl.setText(f"  {txt}   (ΔX {_fmt_mm(abs(d[0]))} · ΔY {_fmt_mm(abs(d[1]))} · ΔZ {_fmt_mm(abs(d[2]))})"
-                             f"{extra}   [{k1} → {k2}]")
+            A, B = meas["sel"]
+            main, sub, seg, lab = _measure(A, B)
+            _draw_result(seg, lab, main)
+            dtxt = ""
+            if seg is not None:
+                d = seg[1] - seg[0]
+                dtxt = f"   (ΔX {_fmt_mm(abs(d[0]))} · ΔY {_fmt_mm(abs(d[1]))} · ΔZ {_fmt_mm(abs(d[2]))})"
+            meas_lbl.setText(f"  {main}{('  ·  ' + sub) if sub else ''}{dtxt}   [① {A['name']}  ↔  ② {B['name']}]")
         pl.render()
 
     def on_press(_obj=None, _evt=None):
@@ -2635,21 +2882,26 @@ def gui_qt(a):
     except Exception:
         pass
 
+    MEAS_HINT = "  거리 측정: 첫 번째 요소를 클릭하세요 — 직선·원/호(중심선)·원통면(중심선)·평면·꼭짓점  (Esc 지우기)"
+
     def toggle_measure(on):
         meas["on"] = on
+        hov["key"] = None
+        _clear_hover_hl()
         if on:
             status.clearMessage()
-            meas_lbl.setText("  거리 측정: 첫 번째 점을 클릭하세요 (꼭짓점·원 중심·모서리에 자동으로 붙음, Esc 지우기)")
+            meas_lbl.setText(MEAS_HINT)
         else:
             meas_clear()
 
     ac_meas = act(headsup, "measure", "", checkable=True,
-                  tip="두 점 거리 측정 (M) — 점 두 개를 차례로 클릭. 원·호는 중심, 꼭짓점·모서리에 자동으로 붙음. Esc 지우기",
+                  tip="요소 거리 측정 (M) — 선·원/호·원통면·평면·꼭짓점을 두 개 차례로 클릭 "
+                      "(선↔선 평행 거리·사잇각, 원↔원 중심선 간 거리, 면↔면 거리). Esc 지우기",
                   shortcut="M")
     ac_meas.toggled.connect(toggle_measure)
     QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), win,
-                        activated=lambda: (meas_clear(), meas["on"] and meas_lbl.setText(
-                            "  거리 측정: 첫 번째 점을 클릭하세요"))).setContext(QtCore.Qt.ApplicationShortcut)
+                        activated=lambda: (meas_clear(), meas["on"] and meas_lbl.setText(MEAS_HINT))
+                        ).setContext(QtCore.Qt.ApplicationShortcut)
 
     # 자동 회전
     rot = {"speed": 1.0}
