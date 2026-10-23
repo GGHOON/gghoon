@@ -107,7 +107,7 @@ SURF_NAMES = {  # GeomAbs_SurfaceType 순서
 }
 
 
-CACHE_VER = 3  # 저장된 결과 형식 버전. 올리면 예전 결과는 자동으로 다시 계산된다
+CACHE_VER = 4  # 저장된 결과 형식 버전. 올리면 예전 결과는 자동으로 다시 계산된다
 
 
 def _check_step_text(text: str) -> str:
@@ -514,7 +514,9 @@ def tessellate_faces(shape):
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopLoc import TopLoc_Location
     from OCP.TopoDS import TopoDS
-    allp, allt, fid, ftext = [], [], [], []
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    allp, allt, fid, ftext, farea = [], [], [], [], []
     off, nf = 0, 0
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
@@ -537,6 +539,12 @@ def tessellate_faces(shape):
             fid.append(np.full(m, nf, dtype=np.int32))
             off += n
         ftext.append(_surface_text(f))
+        try:   # 면적 (원본 곡면 기준 정확값)
+            g = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(f, g)
+            farea.append(round(float(g.Mass()), 6))
+        except Exception:
+            farea.append(None)
         nf += 1
         ex.Next()
     if not allp:
@@ -546,6 +554,7 @@ def tessellate_faces(shape):
     faces = np.hstack([np.full((len(tr), 1), 3, dtype=np.int64), tr]).ravel()
     mesh = pv.PolyData(pts, faces)
     mesh.cell_data["face_id"] = np.concatenate(fid)
+    tessellate_faces.last_area = farea
     return mesh.clean(), ftext
 
 
@@ -562,12 +571,19 @@ def build_surface_features(shape, params=None):
     tol, ang = params
     _mesh_shape(shape, tol, ang)
     mesh, face_text = tessellate_faces(shape)
-    edge_pts, edge_idx, edge_text = [], [], []
-    for e in _unique_edges(shape):
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    face_area = getattr(tessellate_faces, "last_area", None)
+    edge_pts, edge_idx, edge_text, edge_len = [], [], [], []
+    for e in measure_edges(shape):
         r = _edge_feature(e)
-        if r is None:
-            continue
         txt, pts = r
+        try:   # 모서리 길이 (정확값)
+            g = GProp_GProps()
+            BRepGProp.LinearProperties_s(e, g)
+            edge_len.append(round(float(g.Mass()), 6))
+        except Exception:
+            edge_len.append(None)
         edge_idx.append(np.full(len(pts), len(edge_text), dtype=np.int32))
         edge_pts.append(pts)
         edge_text.append(txt)
@@ -577,8 +593,20 @@ def build_surface_features(shape, params=None):
         "edge_text": edge_text,
         "edge_pts": np.vstack(edge_pts) if edge_pts else np.zeros((0, 3), np.float32),
         "edge_idx": np.concatenate(edge_idx) if edge_idx else np.zeros((0,), np.int32),
+        "face_area": face_area if face_area and len(face_area) == len(face_text) else None,
+        "edge_len": edge_len,
     }
     return feat
+
+
+def measure_edges(shape):
+    """측정·마우스 올림에 쓰는 모서리 목록 (번호 = features 의 모서리 번호). 작업 프로세스에서도 같은 순서로 다시 만든다."""
+    return [e for e in _unique_edges(shape) if _edge_feature(e) is not None]
+
+
+def measure_faces(shape):
+    """면 목록 (번호 = 메시의 face_id)"""
+    return list(_faces(shape))
 
 
 def save_features(d: Path, feat: dict):
@@ -587,7 +615,8 @@ def save_features(d: Path, feat: dict):
     import numpy as np
     np.savez_compressed(str(d / "features.npz"), edge_pts=feat["edge_pts"], edge_idx=feat["edge_idx"])
     (d / "features.json").write_text(
-        json.dumps({"face_text": feat["face_text"], "edge_text": feat["edge_text"]}, ensure_ascii=False),
+        json.dumps({"face_text": feat["face_text"], "edge_text": feat["edge_text"],
+                    "face_area": feat.get("face_area"), "edge_len": feat.get("edge_len")}, ensure_ascii=False),
         encoding="utf-8")
 
 
@@ -598,7 +627,8 @@ def load_features(d: Path, mesh):
         z = np.load(str(d / "features.npz"))
         meta = json.loads((d / "features.json").read_text(encoding="utf-8"))
         return {"mesh": mesh, "edge_pts": z["edge_pts"], "edge_idx": z["edge_idx"],
-                "face_text": meta["face_text"], "edge_text": meta["edge_text"]}
+                "face_text": meta["face_text"], "edge_text": meta["edge_text"],
+                "face_area": meta.get("face_area"), "edge_len": meta.get("edge_len")}
     except Exception:
         return None
 
@@ -1420,6 +1450,19 @@ def worker_main():
     except Exception as ex:
         send(kind="warn", msg=repr(ex))
     send(kind="ready")
+    geo = {"shape": None, "faces": [], "edges": [], "dir": None}
+
+    def _geo_shape(spec):
+        """측정 요소 → OCC 형상 (모서리/면 번호 또는 점 좌표)"""
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+        from OCP.gp import gp_Pnt
+        t = spec.get("t")
+        if t == "e":
+            return geo["edges"][int(spec["i"])]
+        if t == "f":
+            return geo["faces"][int(spec["i"])]
+        return BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, spec["p"]))).Vertex()
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1428,6 +1471,25 @@ def worker_main():
         try:
             job = json.loads(line)
             jid = job["id"]
+            op = job.get("op", "build")
+            if op == "geom_load":   # 측정용: 저장된 STEP 사본으로 원본 형상을 다시 읽어 둔다
+                if geo["dir"] != job["dir"]:
+                    d = Path(job["dir"])
+                    text = (d / "model.stp").read_bytes().decode("utf-8", errors="replace")
+                    shape = load_shape_from_text(text, bool(job.get("full_fix")))
+                    geo.update(shape=shape, faces=measure_faces(shape), edges=measure_edges(shape), dir=job["dir"])
+                send(kind="geom_ready", job=jid, nf=len(geo["faces"]), ne=len(geo["edges"]))
+                continue
+            if op == "mindist":     # 두 요소 사이 진짜 최소 거리 (원본 곡면 기준)
+                from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+                dd = BRepExtrema_DistShapeShape(_geo_shape(job["a"]), _geo_shape(job["b"]))
+                if not dd.IsDone() or dd.NbSolution() < 1:
+                    send(kind="mindist", job=jid, ok=False)
+                else:
+                    p1, p2 = dd.PointOnShape1(1), dd.PointOnShape2(1)
+                    send(kind="mindist", job=jid, ok=True, value=dd.Value(),
+                         p1=[p1.X(), p1.Y(), p1.Z()], p2=[p2.X(), p2.Y(), p2.Z()])
+                continue
             d = Path(job["dir"])
             t0 = time.perf_counter()
             send(kind="stage", job=jid, msg="STEP 해석 중 (형상 변환)")
@@ -2376,11 +2438,17 @@ def gui_qt(a):
                 ne = _nearest_edge(feat, world)   # 1) 가까운 모서리(선/호/원)인가? (화면 약 7픽셀 이내)
                 if ne is not None and ne[1] < max(_px_world(world, 7), diag * 1e-4):
                     key, txt = ("e", ne[0]), feat["edge_text"][ne[0]]
+                    el = feat.get("edge_len")
+                    if el and el[ne[0]] is not None and not txt.startswith("직선"):
+                        txt += f"  길이 {_fmt_mm(el[ne[0]])}"
                     hl_pts = feat["edge_pts"][feat["edge_idx"] == ne[0]]
                 elif feat:                         # 2) 아니면 올린 면의 치수
                     try:
                         fid = int(scene.mesh.cell_data["face_id"][pk.GetCellId()])
                         key, txt = ("f", fid), feat["face_text"][fid]
+                        fa = feat.get("face_area")
+                        if fa and fa[fid] is not None:
+                            txt += f"  면적 {_fmt_mm(fa[fid])} mm²"
                     except Exception:
                         pass
         if key != hov.get("key"):
@@ -2759,7 +2827,12 @@ def gui_qt(a):
         if meas.get("ov") is not None:
             meas["ov"].RemoveAllViewProps()
         meas["names"], meas["sel"] = [], []
+        meas["res_item"] = meas["md_row"] = None
         meas_lbl.setText("")
+        try:
+            meas_tree.clear()
+        except NameError:
+            pass
         if render:
             pl.render()
 
@@ -2840,6 +2913,184 @@ def gui_qt(a):
         except Exception:
             pass
 
+    # --- 측정 결과 패널 (왼쪽 '측정' 탭): 선택 요소의 좌표·길이·지름·면적·방향 + 결과 + 최소 거리
+    meas_tree = QtWidgets.QTreeWidget(); meas_tree.setHeaderLabels(["항목", "값"])
+    meas_tree.setAlternatingRowColors(True); meas_tree.setColumnWidth(0, 120)
+    meas_tree.setToolTip("값을 더블클릭하면 복사됩니다")
+    tabs.addTab(meas_tree, "측정")
+
+    def _copy_item(it, _col=0):
+        QtWidgets.QApplication.clipboard().setText(it.text(1) or it.text(0))
+        say(f"복사함: {it.text(1) or it.text(0)}")
+    meas_tree.itemDoubleClicked.connect(_copy_item)
+
+    def _xyz(p):
+        return f"X {_fmt_mm(p[0])},  Y {_fmt_mm(p[1])},  Z {_fmt_mm(p[2])}"
+
+    def _dir(v):
+        v = [round(float(c), 4) + 0.0 for c in v]   # -0.0000 방지
+        return f"({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f})"
+
+    def _elem_rows(e):
+        """요소 하나의 상세 (항목, 값) 목록"""
+        feat = scene.feat or {}
+        rows = [("종류", e["name"])]
+        k = e["key"]
+        if k[0] == "e":
+            L = (feat.get("edge_len") or [None] * (k[1] + 1))[k[1]]
+            if L is not None:
+                rows.append(("둘레" if e["name"].startswith("원") else ("호 길이" if e["name"].startswith("호") else "길이"),
+                             f"{_fmt_mm(L)} mm"))
+            if e["kind"] == "line":
+                rows += [("시작점", _xyz(e["a"])), ("끝점", _xyz(e["b"])), ("방향", _dir(e["d"]))]
+        if k[0] == "f":
+            A_ = (feat.get("face_area") or [None] * (k[1] + 1))[k[1]]
+            if A_ is not None:
+                rows.append(("면적", f"{_fmt_mm(A_)} mm²"))
+        if e["kind"] == "axis":
+            if e.get("circle"):
+                rows += [("지름", f"Ø{_fmt_mm(2 * e['r'])} mm  (R{_fmt_mm(e['r'])})"), ("중심 좌표", _xyz(e["c"]))]
+            else:
+                rows.append(("중심선 위 점", _xyz(e["c"])))
+            rows.append(("중심선 방향", _dir(e["d"])))
+        elif e["kind"] == "plane":
+            rows += [("법선 방향", _dir(e["n"])), ("클릭한 점", _xyz(e["p"]))]
+        elif e["kind"] == "point":
+            rows.append(("좌표", _xyz(e["p"])))
+        return rows
+
+    def _fill_meas_tree(result_rows=None):
+        meas_tree.clear()
+        bold = QtGui.QFont(); bold.setBold(True)
+        for i, e in enumerate(meas["sel"]):
+            top = QtWidgets.QTreeWidgetItem(["①②"[i] + " 요소", e["name"]]); top.setFont(0, bold)
+            for a, b in _elem_rows(e):
+                QtWidgets.QTreeWidgetItem(top, [a, b])
+            meas_tree.addTopLevelItem(top); top.setExpanded(True)
+        if result_rows:
+            top = QtWidgets.QTreeWidgetItem(["결과", result_rows[0][1]]); top.setFont(0, bold); top.setFont(1, bold)
+            for a, b in result_rows[1:]:
+                QtWidgets.QTreeWidgetItem(top, [a, b])
+            meas_tree.addTopLevelItem(top); top.setExpanded(True)
+            meas["res_item"] = top
+        meas_tree.resizeColumnToContents(0)
+
+    # --- 최소 거리 (원본 곡면 기준, 별도 계산 프로세스에서) — Mayo 의 '최소 거리'와 같은 계산
+    gk = {"proc": None, "q": queue.Queue(), "jid": 0, "cb": {}, "dir": None, "ready_dir": None}
+
+    def _gk_start():
+        if gk["proc"] is not None and gk["proc"].poll() is None:
+            return True
+        try:
+            flags = 0x08000000 if sys.platform == "win32" else 0
+            logf = open(LOG_PATH.with_name("step_worker.log"), "a", encoding="utf-8")
+            proc = subprocess.Popen(self_command() + ["--worker"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=logf, text=True, encoding="utf-8", bufsize=1, creationflags=flags)
+        except Exception:
+            gk["proc"] = None
+            return False
+        gk["proc"], gk["ready_dir"] = proc, None
+
+        def reader():
+            for line in proc.stdout:
+                if line.startswith("@@"):
+                    try:
+                        gk["q"].put(json.loads(line[2:]))
+                    except Exception:
+                        pass
+        threading.Thread(target=reader, daemon=True).start()
+        return True
+
+    def _gk_send(job, cb=None):
+        if not _gk_start():
+            return False
+        gk["jid"] += 1
+        job["id"] = gk["jid"]
+        if cb:
+            gk["cb"][gk["jid"]] = cb
+        try:
+            gk["proc"].stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
+            gk["proc"].stdin.flush()
+            return True
+        except Exception:
+            gk["proc"] = None
+            return False
+
+    def _gk_poll():
+        while True:
+            try:
+                m = gk["q"].get_nowait()
+            except queue.Empty:
+                break
+            cb = gk["cb"].pop(m.get("job"), None)
+            if cb:
+                try:
+                    cb(m)
+                except Exception:
+                    pass
+    gk_timer = QtCore.QTimer(win); gk_timer.setInterval(80); gk_timer.timeout.connect(_gk_poll); gk_timer.start()
+
+    def geo_prepare():
+        """측정 모드가 켜져 있으면 현재 모델의 원본 형상을 계산 프로세스에 미리 읽혀 둔다 (화면은 멈추지 않음)"""
+        mm = meas.get("model")
+        if not meas["on"] or not mm or gk["dir"] == mm["dir"]:
+            return
+        gk["dir"] = mm["dir"]
+
+        def ready(m, d=mm["dir"]):
+            if m.get("kind") == "geom_ready" and gk["dir"] == d:
+                feat = scene.feat or {}
+                ok = m.get("nf") == len(feat.get("face_text", [])) and m.get("ne") == len(feat.get("edge_text", []))
+                gk["ready_dir"] = d if ok else None
+                if len(meas["sel"]) == 2:
+                    _ask_mindist()
+        _gk_send({"op": "geom_load", "dir": mm["dir"], "full_fix": mm["full"]}, ready)
+
+    def _spec(e):
+        k = e["key"]
+        if k[0] in ("e", "f"):
+            return {"t": k[0], "i": int(k[1])}
+        return {"t": "p", "p": [float(v) for v in e["p"]]}
+
+    def _ask_mindist():
+        if len(meas["sel"]) != 2:
+            return
+        sel_id = id(meas["sel"])
+        mm = meas.get("model")
+        if not mm or gk["ready_dir"] != mm["dir"]:
+            _set_mindist("원본 형상 준비 중… (잠시 후 자동 표시)")
+            return
+        A, B = meas["sel"]
+
+        def got(m):
+            if id(meas["sel"]) != sel_id or len(meas["sel"]) != 2:
+                return
+            if m.get("kind") != "mindist" or not m.get("ok"):
+                _set_mindist("계산 실패")
+                return
+            p1, p2 = _np.array(m["p1"]), _np.array(m["p2"])
+            _set_mindist(f"{_fmt_mm(m['value'])} mm", p1, p2)
+        _set_mindist("계산 중…")
+        _gk_send({"op": "mindist", "a": _spec(A), "b": _spec(B)}, got)
+
+    def _set_mindist(txt, p1=None, p2=None):
+        it = meas.get("res_item")
+        if it is None:
+            return
+        row = meas.get("md_row")
+        if row is None or row.parent() is not it:
+            row = QtWidgets.QTreeWidgetItem(it, ["최소 거리", ""])
+            meas["md_row"] = row
+        row.setText(1, txt + ("  (원본 곡면 기준 정확값)" if p1 is not None else ""))
+        if p1 is not None:
+            QtWidgets.QTreeWidgetItem(it, ["최소 거리 점①", _xyz(p1)])
+            QtWidgets.QTreeWidgetItem(it, ["최소 거리 점②", _xyz(p2)])
+            meas_lbl.setText(meas_lbl.text() + f"   ·   최소 거리 {txt}")
+            if float(_np.linalg.norm(p2 - p1)) > 1e-9:   # 최소 거리 위치를 회색 점선으로
+                _meas_add(_dashes(p1, p2, 8), color="#5a5a60", line_width=2)
+                pl.render()
+        meas_tree.resizeColumnToContents(0)
+
     def meas_pick(x, y):
         e = _entity_at(x, y)
         if e is None:
@@ -2847,19 +3098,33 @@ def gui_qt(a):
         if len(meas["sel"]) >= 2:          # 세 번째 클릭 → 새 측정 시작
             meas_clear(render=False)
         meas["sel"].append(e)
+        meas["res_item"] = meas["md_row"] = None
         _draw_entity(e)
         status.clearMessage()
+        tabs.setCurrentWidget(meas_tree)
         if len(meas["sel"]) == 1:
             meas_lbl.setText(f"  ① {e['name']}  선택  → 두 번째 요소(선·원·호·면·꼭짓점)를 클릭하세요")
+            _fill_meas_tree()
         else:
             A, B = meas["sel"]
             main, sub, seg, lab = _measure(A, B)
             _draw_result(seg, lab, main)
-            dtxt = ""
+            dtxt, rows = "", [("결과", main)]
+            if sub:
+                rows.append(("참고", sub))
             if seg is not None:
                 d = seg[1] - seg[0]
                 dtxt = f"   (ΔX {_fmt_mm(abs(d[0]))} · ΔY {_fmt_mm(abs(d[1]))} · ΔZ {_fmt_mm(abs(d[2]))})"
+                rows += [("ΔX", f"{_fmt_mm(abs(d[0]))} mm"), ("ΔY", f"{_fmt_mm(abs(d[1]))} mm"),
+                         ("ΔZ", f"{_fmt_mm(abs(d[2]))} mm"), ("치수선 점①", _xyz(seg[0])), ("치수선 점②", _xyz(seg[1]))]
+            fa = (scene.feat or {}).get("face_area")
+            if fa and A["key"][0] == "f" and B["key"][0] == "f" and A["key"] != B["key"]:
+                a1, a2 = fa[A["key"][1]], fa[B["key"][1]]
+                if a1 is not None and a2 is not None:
+                    rows.append(("면적 합계", f"{_fmt_mm(a1 + a2)} mm²"))
             meas_lbl.setText(f"  {main}{('  ·  ' + sub) if sub else ''}{dtxt}   [① {A['name']}  ↔  ② {B['name']}]")
+            _fill_meas_tree(rows)
+            _ask_mindist()
         pl.render()
 
     def on_press(_obj=None, _evt=None):
@@ -2891,6 +3156,7 @@ def gui_qt(a):
         if on:
             status.clearMessage()
             meas_lbl.setText(MEAS_HINT)
+            geo_prepare()
         else:
             meas_clear()
 
@@ -3016,6 +3282,8 @@ def gui_qt(a):
             except Exception as ex:
                 say(f"기록 저장 실패: {ex}")
         meas_clear(render=False)   # 이전 모델의 측정 표시 지우기
+        meas["model"] = {"dir": str(model_dir(text)), "full": info.get("fix_mode") == "full"}
+        QtCore.QTimer.singleShot(300, geo_prepare)
         scene.load(info, state["color"])
         for k, ac in sec_acts.items():
             ac.setChecked(False)
@@ -3206,6 +3474,11 @@ def gui_qt(a):
         try:
             if wk["proc"] is not None:
                 wk["proc"].kill()
+        except Exception:
+            pass
+        try:
+            if gk["proc"] is not None:
+                gk["proc"].kill()
         except Exception:
             pass
         try:
@@ -3469,6 +3742,21 @@ def _selftest_worker(text: str, d: Path):
         else:
             raise AssertionError("계산 프로세스가 결과 없이 종료됨")
         assert (d / "info.json").exists() and (d / "mesh.vtp").exists(), "계산 결과 파일 없음"
+        # 측정용: 원본 형상 다시 읽기 + 최소 거리 (면 0 ↔ 면 1)
+        for job in ({"id": 2, "op": "geom_load", "dir": str(d)},
+                    {"id": 3, "op": "mindist", "a": {"t": "f", "i": 0}, "b": {"t": "f", "i": 1}}):
+            proc.stdin.write(json.dumps(job) + "\n")
+            proc.stdin.flush()
+            for line in proc.stdout:
+                if line.startswith("@@"):
+                    m = json.loads(line[2:])
+                    if m.get("kind") == "error":
+                        raise AssertionError("측정 계산 오류:\n" + m.get("msg", ""))
+                    if m.get("job") == job["id"]:
+                        assert m.get("kind") in ("geom_ready", "mindist"), m
+                        if m["kind"] == "mindist":
+                            assert m.get("ok"), "최소 거리 계산 실패"
+                        break
     finally:
         try:
             proc.kill()
